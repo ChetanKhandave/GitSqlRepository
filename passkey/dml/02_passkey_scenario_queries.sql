@@ -1,0 +1,188 @@
+-- Oracle 19c DML templates executed by the Java application.
+-- Bind variables use :name notation for readability.
+-- Hash comparisons are performed in Java.
+
+-- COMMON LOOKUPS -------------------------------------------------------------
+SELECT CUST_NUMBER, PASSKEY_HASH, ACTIVATED_TIME, ACTIVATION_REQUEST_ID, VERSION_NO
+FROM ACTIVE_PASSKEY
+WHERE CUST_NUMBER = :custNumber;
+
+SELECT VERIFICATION_CYCLE_ID, CUST_NUMBER, PASSKEY_HASH,
+       COOLING_START_TIME, COOLING_END_TIME, CREATED_REQUEST_ID, VERSION_NO
+FROM PASSKEY_PENDING_VERIFICATION
+WHERE CUST_NUMBER = :custNumber;
+
+-- Use before state-changing scenarios. Always lock ACTIVE before PENDING.
+SELECT CUST_NUMBER, PASSKEY_HASH, ACTIVATED_TIME, ACTIVATION_REQUEST_ID, VERSION_NO
+FROM ACTIVE_PASSKEY
+WHERE CUST_NUMBER = :custNumber
+FOR UPDATE;
+
+SELECT VERIFICATION_CYCLE_ID, CUST_NUMBER, PASSKEY_HASH,
+       COOLING_START_TIME, COOLING_END_TIME, CREATED_REQUEST_ID, VERSION_NO
+FROM PASSKEY_PENDING_VERIFICATION
+WHERE CUST_NUMBER = :custNumber
+FOR UPDATE;
+
+-- SCENARIO 1: frontend verification failed ----------------------------------
+-- No SQL. No passkey update, cooling period, SMS, or PRM reporting.
+
+-- MALFORMED REQUEST -----------------------------------------------------------
+-- Validate in Java before executing SQL. Return "Unable to serve your request."
+
+-- SCENARIOS 2 AND 3: first verified passkey ---------------------------------
+INSERT INTO ACTIVE_PASSKEY
+(CUST_NUMBER, PASSKEY_HASH, ACTIVATED_TIME, ACTIVATION_REQUEST_ID,
+ CREATED_TIME, UPDATED_TIME, VERSION_NO)
+VALUES
+(:custNumber, :incomingHash, SYSTIMESTAMP, :requestId,
+ SYSTIMESTAMP, SYSTIMESTAMP, 0);
+
+-- SCENARIO 4: incoming hash matches ACTIVE ----------------------------------
+-- Read ACTIVE. If no PENDING exists, no DML is required.
+-- If a PENDING row exists, execute Scenario 6.
+
+-- CREATE NEW PENDING CYCLE: used by Scenarios 5, 8 and 10 -------------------
+SELECT SEQ_PASSKEY_VERIFICATION_CYCLE.NEXTVAL AS VERIFICATION_CYCLE_ID
+FROM DUAL;
+
+INSERT INTO PASSKEY_PENDING_VERIFICATION
+(VERIFICATION_CYCLE_ID, CUST_NUMBER, PASSKEY_HASH,
+ COOLING_START_TIME, COOLING_END_TIME, CREATED_REQUEST_ID,
+ CREATED_TIME, UPDATED_TIME, VERSION_NO)
+VALUES
+(:verificationCycleId, :custNumber, :incomingHash,
+ SYSTIMESTAMP, SYSTIMESTAMP + NUMTODSINTERVAL(48, 'HOUR'), :requestId,
+ SYSTIMESTAMP, SYSTIMESTAMP, 0);
+
+INSERT INTO PASSKEY_SMS_SCHEDULE
+(SMS_SCHEDULE_ID, VERIFICATION_CYCLE_ID, CUST_NUMBER, SMS_SEQUENCE,
+ SCHEDULED_TIME, NEXT_ATTEMPT_TIME, SMS_STATUS, CREATED_TIME, UPDATED_TIME)
+SELECT SEQ_PASSKEY_SMS_SCHEDULE.NEXTVAL,
+       P.VERIFICATION_CYCLE_ID,
+       P.CUST_NUMBER,
+       S.SMS_SEQUENCE,
+       CASE S.SMS_SEQUENCE
+           WHEN 1 THEN P.COOLING_START_TIME
+           WHEN 2 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(15, 'HOUR')
+           WHEN 3 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(30, 'HOUR')
+           WHEN 4 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(46, 'HOUR')
+       END,
+       CASE S.SMS_SEQUENCE
+           WHEN 1 THEN P.COOLING_START_TIME
+           WHEN 2 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(15, 'HOUR')
+           WHEN 3 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(30, 'HOUR')
+           WHEN 4 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(46, 'HOUR')
+       END,
+       'PENDING', SYSTIMESTAMP, SYSTIMESTAMP
+FROM PASSKEY_PENDING_VERIFICATION P
+CROSS JOIN
+(
+    SELECT 1 SMS_SEQUENCE FROM DUAL UNION ALL
+    SELECT 2 FROM DUAL UNION ALL
+    SELECT 3 FROM DUAL UNION ALL
+    SELECT 4 FROM DUAL
+) S
+WHERE P.VERIFICATION_CYCLE_ID = :verificationCycleId;
+
+-- SCENARIO 5: first mismatch -------------------------------------------------
+-- In one transaction: generate cycle, insert pending, insert four SMS rows.
+
+-- ARCHIVE CURRENT PENDING: reusable -----------------------------------------
+INSERT INTO PASSKEY_ARCHIVAL
+(ARCHIVAL_ID, CUST_NUMBER, PASSKEY_HASH, SOURCE_TYPE,
+ VERIFICATION_CYCLE_ID, ORIGINAL_REQUEST_ID, ORIGINAL_CREATED_TIME,
+ ORIGINAL_COOLING_START_TIME, ORIGINAL_COOLING_END_TIME,
+ ARCHIVE_REASON, ARCHIVED_REQUEST_ID, ARCHIVED_TIME)
+SELECT SEQ_PASSKEY_ARCHIVAL.NEXTVAL,
+       CUST_NUMBER, PASSKEY_HASH, 'PENDING_VERIFICATION',
+       VERIFICATION_CYCLE_ID, CREATED_REQUEST_ID, CREATED_TIME,
+       COOLING_START_TIME, COOLING_END_TIME,
+       :archiveReason, :requestId, SYSTIMESTAMP
+FROM PASSKEY_PENDING_VERIFICATION
+WHERE CUST_NUMBER = :custNumber
+  AND VERIFICATION_CYCLE_ID = :verificationCycleId;
+
+-- CANCEL UNSENT SMS: reusable ------------------------------------------------
+UPDATE PASSKEY_SMS_SCHEDULE
+SET SMS_STATUS = 'CANCELLED',
+    CANCELLED_TIME = SYSTIMESTAMP,
+    CANCEL_REASON = :cancelReason,
+    LOCKED_BY = NULL,
+    LOCKED_TIME = NULL,
+    UPDATED_TIME = SYSTIMESTAMP
+WHERE VERIFICATION_CYCLE_ID = :verificationCycleId
+  AND SMS_STATUS IN ('PENDING', 'QUEUED');
+
+-- DELETE CURRENT PENDING: reusable ------------------------------------------
+DELETE FROM PASSKEY_PENDING_VERIFICATION
+WHERE CUST_NUMBER = :custNumber
+  AND VERIFICATION_CYCLE_ID = :verificationCycleId;
+
+-- SCENARIO 6: original ACTIVE hash used during cooling ----------------------
+-- Transaction order:
+-- 1. Archive PENDING using archiveReason = 'ACTIVE_HASH_RECONFIRMED'.
+-- 2. Cancel PENDING/QUEUED SMS using same reason.
+-- 3. Delete PENDING row.
+-- ACTIVE remains unchanged.
+
+-- SCENARIO 7: same PENDING hash during cooling -------------------------------
+SELECT VERIFICATION_CYCLE_ID, PASSKEY_HASH,
+       COOLING_START_TIME, COOLING_END_TIME,
+       CASE WHEN SYSTIMESTAMP < COOLING_END_TIME THEN 'Y' ELSE 'N' END
+           AS COOLING_ACTIVE
+FROM PASSKEY_PENDING_VERIFICATION
+WHERE CUST_NUMBER = :custNumber;
+-- If incoming matches PENDING and COOLING_ACTIVE='Y', no DML is required.
+
+-- SCENARIO 8: third hash during cooling -------------------------------------
+-- Transaction order:
+-- 1. Lock ACTIVE then PENDING.
+-- 2. Archive old PENDING with 'PENDING_REPLACED_DURING_COOLING'.
+-- 3. Cancel old unsent SMS with same reason.
+-- 4. Delete old PENDING.
+-- 5. Generate new cycle, insert new PENDING, insert four new SMS rows.
+
+-- SCENARIO 9: matching PENDING hash after cooling ----------------------------
+-- Archive current ACTIVE before replacing it.
+INSERT INTO PASSKEY_ARCHIVAL
+(ARCHIVAL_ID, CUST_NUMBER, PASSKEY_HASH, SOURCE_TYPE,
+ ORIGINAL_REQUEST_ID, ORIGINAL_CREATED_TIME, ORIGINAL_ACTIVATED_TIME,
+ ARCHIVE_REASON, ARCHIVED_REQUEST_ID, ARCHIVED_TIME)
+SELECT SEQ_PASSKEY_ARCHIVAL.NEXTVAL,
+       CUST_NUMBER, PASSKEY_HASH, 'ACTIVE',
+       ACTIVATION_REQUEST_ID, CREATED_TIME, ACTIVATED_TIME,
+       'ACTIVE_REPLACED_AFTER_COOLING', :requestId, SYSTIMESTAMP
+FROM ACTIVE_PASSKEY
+WHERE CUST_NUMBER = :custNumber;
+
+-- Replace ACTIVE only when cooling has completed.
+UPDATE ACTIVE_PASSKEY A
+SET A.PASSKEY_HASH =
+    (SELECT P.PASSKEY_HASH
+       FROM PASSKEY_PENDING_VERIFICATION P
+      WHERE P.CUST_NUMBER = A.CUST_NUMBER
+        AND P.VERIFICATION_CYCLE_ID = :verificationCycleId
+        AND SYSTIMESTAMP >= P.COOLING_END_TIME),
+    A.ACTIVATED_TIME = SYSTIMESTAMP,
+    A.ACTIVATION_REQUEST_ID = :requestId,
+    A.UPDATED_TIME = SYSTIMESTAMP,
+    A.VERSION_NO = A.VERSION_NO + 1
+WHERE A.CUST_NUMBER = :custNumber
+  AND EXISTS
+      (SELECT 1
+         FROM PASSKEY_PENDING_VERIFICATION P
+        WHERE P.CUST_NUMBER = A.CUST_NUMBER
+          AND P.VERIFICATION_CYCLE_ID = :verificationCycleId
+          AND SYSTIMESTAMP >= P.COOLING_END_TIME);
+-- Java must verify exactly one row was updated.
+-- Then cancel unsent SMS using reason 'PENDING_HASH_ACTIVATED' and delete PENDING.
+
+-- SCENARIO 10: different hash after cooling ---------------------------------
+-- Transaction order:
+-- 1. Lock ACTIVE then PENDING.
+-- 2. Archive old PENDING with 'PENDING_REPLACED_AFTER_COOLING'.
+-- 3. Cancel old unsent SMS with same reason.
+-- 4. Delete old PENDING.
+-- 5. Generate new cycle, insert new PENDING, insert four new SMS rows.
+-- Existing ACTIVE remains unchanged.

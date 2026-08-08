@@ -4,26 +4,13 @@
 -- Design principles:
 --   1. ACTIVE_PASSKEY stores only the currently trusted passkey.
 --   2. PASSKEY_PENDING_VERIFICATION stores only the current changed passkey
---      while the 48-hour cooling period is active or awaiting re-attempt.
+--      while the 48-hour cooling period applies.
 --   3. PASSKEY_ARCHIVAL stores immutable history of replaced/cancelled hashes.
 --   4. PASSKEY_SMS_SCHEDULE stores SMS timing/delivery state independently.
---   5. All timestamps use TIMESTAMP WITH TIME ZONE. Application/database
---      deployments should use UTC consistently.
+--   5. ARCHIVAL_ID and SMS_SCHEDULE_ID are technical surrogate keys generated
+--      by Oracle identity columns; Java never supplies these values.
+--   6. All timestamps use TIMESTAMP WITH TIME ZONE and DML uses UTC explicitly.
 -- ============================================================================
-
--- Sequence used only to generate the primary key of PASSKEY_ARCHIVAL.
-CREATE SEQUENCE SEQ_PASSKEY_ARCHIVAL
-    START WITH 1
-    INCREMENT BY 1
-    CACHE 100
-    NOCYCLE;
-
--- Sequence used only to generate the primary key of PASSKEY_SMS_SCHEDULE.
-CREATE SEQUENCE SEQ_PASSKEY_SMS_SCHEDULE
-    START WITH 1
-    INCREMENT BY 1
-    CACHE 100
-    NOCYCLE;
 
 -- ============================================================================
 -- ACTIVE_PASSKEY
@@ -40,7 +27,7 @@ CREATE TABLE ACTIVE_PASSKEY
     -- Current trusted passkey hash received from frontend.
     PASSKEY_HASH    VARCHAR2(150 CHAR) NOT NULL,
 
-    -- Time at which this active row was inserted or its hash/mobile was updated.
+    -- UTC time at which the active row was inserted or its hash/mobile was updated.
     UPDATED_TIME    TIMESTAMP(6) WITH TIME ZONE
                         DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
 
@@ -69,11 +56,11 @@ CREATE TABLE PASSKEY_PENDING_VERIFICATION
     -- Exact UTC time when the current cooling period completes.
     COOLING_END_TIME    TIMESTAMP(6) WITH TIME ZONE NOT NULL,
 
-    -- CUST_ID is the primary key because only one pending hash is allowed/customer.
+    -- One PENDING row per customer is the business invariant.
     CONSTRAINT PK_PENDING_VERIFICATION
         PRIMARY KEY (CUST_ID),
 
-    -- Protects against invalid cooling windows.
+    -- Prevent an invalid or zero-length cooling window.
     CONSTRAINT CK_PENDING_COOLING_TIME
         CHECK (COOLING_END_TIME > COOLING_START_TIME)
 );
@@ -81,9 +68,8 @@ CREATE TABLE PASSKEY_PENDING_VERIFICATION
 -- ============================================================================
 -- PASSKEY_ARCHIVAL
 -- Immutable history of ACTIVE or PENDING hashes that are no longer current.
--- ARCHIVE_REASON stores a short stable reason code rather than long text.
 --
--- Reason code mapping:
+-- ARCHIVE_REASON code mapping:
 --   AR101 = Previous ACTIVE hash replaced after successful 48-hour cooling.
 --   AR102 = PENDING hash archived because original ACTIVE hash was reconfirmed.
 --   AR103 = PENDING hash replaced by another hash during cooling.
@@ -91,32 +77,36 @@ CREATE TABLE PASSKEY_PENDING_VERIFICATION
 -- ============================================================================
 CREATE TABLE PASSKEY_ARCHIVAL
 (
-    -- Unique archive record identifier.
-    ARCHIVAL_ID                 NUMBER NOT NULL,
+    -- Technical surrogate key generated only by Oracle.
+    -- GENERATED ALWAYS prevents Java/manual INSERT statements from supplying it.
+    ARCHIVAL_ID                 NUMBER
+                                GENERATED ALWAYS AS IDENTITY
+                                (START WITH 1 INCREMENT BY 1 CACHE 100 NOCYCLE)
+                                NOT NULL,
 
     -- Customer to whom the archived hash belonged.
     CUST_ID                     VARCHAR2(20 CHAR) NOT NULL,
 
-    -- Hash value that has been removed from ACTIVE or PENDING state.
+    -- Hash value removed from ACTIVE or PENDING state.
     PASSKEY_HASH                VARCHAR2(150 CHAR) NOT NULL,
 
-    -- Indicates whether archived hash came from ACTIVE or PENDING table.
+    -- Origin of the archived hash.
     SOURCE_TYPE                 VARCHAR2(30 CHAR) NOT NULL,
 
-    -- For ACTIVE source: original ACTIVE_PASSKEY.UPDATED_TIME.
-    -- For PENDING source this value remains NULL.
+    -- Populated for SOURCE_TYPE='ACTIVE' from ACTIVE_PASSKEY.UPDATED_TIME.
+    -- NULL when the archived source was PENDING_VERIFICATION.
     ORIGINAL_UPDATED_TIME       TIMESTAMP(6) WITH TIME ZONE,
 
-    -- For PENDING source: original cooling start time. NULL for ACTIVE source.
+    -- Populated for a PENDING source; NULL for an ACTIVE source.
     ORIGINAL_COOLING_START_TIME TIMESTAMP(6) WITH TIME ZONE,
 
-    -- For PENDING source: original cooling end time. NULL for ACTIVE source.
+    -- Populated for a PENDING source; NULL for an ACTIVE source.
     ORIGINAL_COOLING_END_TIME   TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Stable archive reason code: AR101, AR102, AR103 or AR104.
+    -- Stable business/audit code rather than free-form reason text.
     ARCHIVE_REASON              VARCHAR2(10 CHAR) NOT NULL,
 
-    -- UTC time at which the record was copied into archival history.
+    -- UTC time at which this historical record was inserted.
     ARCHIVED_TIME               TIMESTAMP(6) WITH TIME ZONE
                                     DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
 
@@ -127,85 +117,99 @@ CREATE TABLE PASSKEY_ARCHIVAL
         CHECK (SOURCE_TYPE IN ('ACTIVE', 'PENDING_VERIFICATION')),
 
     CONSTRAINT CK_PASSKEY_ARCHIVE_REASON
-        CHECK (ARCHIVE_REASON IN ('AR101', 'AR102', 'AR103', 'AR104'))
+        CHECK (ARCHIVE_REASON IN ('AR101', 'AR102', 'AR103', 'AR104')),
+
+    -- Keep SOURCE_TYPE and ARCHIVE_REASON semantically consistent.
+    -- AR101 archives an ACTIVE record; AR102/AR103/AR104 archive PENDING records.
+    CONSTRAINT CK_ARCHIVAL_REASON_SOURCE
+        CHECK
+        (
+            (ARCHIVE_REASON = 'AR101' AND SOURCE_TYPE = 'ACTIVE')
+            OR
+            (ARCHIVE_REASON IN ('AR102', 'AR103', 'AR104')
+             AND SOURCE_TYPE = 'PENDING_VERIFICATION')
+        )
 );
 
 -- ============================================================================
 -- PASSKEY_SMS_SCHEDULE
--- Stores one row for each SMS. Four rows are created for every mismatch cycle:
---   sequence 1 = immediately
---   sequence 2 = cooling start + 15 hours
---   sequence 3 = cooling start + 30 hours
---   sequence 4 = cooling start + 46 hours
+-- One row represents one SMS. Four rows are created for each mismatch cycle:
+--   SMS_SEQUENCE=1 -> immediately
+--   SMS_SEQUENCE=2 -> cooling start + 15 hours
+--   SMS_SEQUENCE=3 -> cooling start + 30 hours
+--   SMS_SEQUENCE=4 -> cooling start + 46 hours
 --
--- Because VERIFICATION_CYCLE_ID was intentionally removed from the simplified
--- passkey tables, CUST_ID + COOLING_START_TIME identify the SMS cooling cycle.
+-- The simplified PENDING table has no synthetic cycle ID. Therefore
+-- CUST_ID + COOLING_START_TIME identify one cooling/SMS cycle.
 -- ============================================================================
 CREATE TABLE PASSKEY_SMS_SCHEDULE
 (
-    -- Unique identifier for each individual scheduled SMS.
-    SMS_SCHEDULE_ID         NUMBER NOT NULL,
+    -- Technical surrogate key generated only by Oracle.
+    SMS_SCHEDULE_ID         NUMBER
+                            GENERATED ALWAYS AS IDENTITY
+                            (START WITH 1 INCREMENT BY 1 CACHE 100 NOCYCLE)
+                            NOT NULL,
 
-    -- Customer for whom the SMS is scheduled.
+    -- Customer for whom this SMS is scheduled.
     CUST_ID                 VARCHAR2(20 CHAR) NOT NULL,
 
-    -- Mobile number snapshot used for this SMS cycle.
+    -- Mobile-number snapshot for this cooling cycle.
     MOBILE_NUMBER           VARCHAR2(20 CHAR) NOT NULL,
 
-    -- Snapshot of the cooling start time; identifies the corresponding cycle.
+    -- Snapshot of the PENDING cooling start; forms the logical cycle identifier.
     COOLING_START_TIME      TIMESTAMP(6) WITH TIME ZONE NOT NULL,
 
     -- 1=immediate, 2=15h, 3=30h, 4=46h.
     SMS_SEQUENCE            NUMBER(1) NOT NULL,
 
-    -- Business scheduled time for this SMS.
+    -- Business time at which this SMS becomes due.
     SCHEDULED_TIME          TIMESTAMP(6) WITH TIME ZONE NOT NULL,
 
-    -- Used only when a failed SMS is scheduled for retry.
+    -- Populated only when a retry should occur later than SCHEDULED_TIME.
     NEXT_ATTEMPT_TIME       TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Current delivery state used by database scanner and DelayQueue workers.
+    -- Current scheduler/delivery state.
     SMS_STATUS              VARCHAR2(20 CHAR) DEFAULT 'PENDING' NOT NULL,
 
-    -- Time scheduler claimed the row and placed/planned it for DelayQueue.
+    -- Time the scheduler claimed the row for a DelayQueue instance.
     QUEUED_TIME             TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Time SMS worker started provider processing.
+    -- Time a worker changed QUEUED -> PROCESSING before provider invocation.
     PROCESSING_START_TIME   TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Successful provider-send timestamp.
+    -- Time successful provider delivery was persisted.
     SENT_TIME               TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Time an unsent message was cancelled because pending state changed.
+    -- Time an unsent SMS was cancelled because the passkey state changed.
     CANCELLED_TIME          TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Operational cancellation reason. Kept separate from archive reason code.
+    -- Operational cancellation reason; separate from archival ARxxx codes.
     CANCEL_REASON           VARCHAR2(60 CHAR),
 
-    -- Number of provider send attempts made for this SMS.
+    -- Number of actual provider-processing attempts.
     ATTEMPT_COUNT           NUMBER DEFAULT 0 NOT NULL,
 
-    -- Masked/truncated provider or technical error for support purposes.
+    -- Masked/truncated technical/provider error. Must not contain sensitive data.
     LAST_ERROR_MESSAGE      VARCHAR2(1000 CHAR),
 
-    -- Scheduler/JVM instance currently holding the temporary processing lease.
+    -- Scheduler/JVM instance holding the temporary lease.
     LOCKED_BY               VARCHAR2(100 CHAR),
 
-    -- Time the temporary scheduler lease was acquired.
+    -- UTC time the temporary scheduler lease was acquired.
     LOCKED_TIME             TIMESTAMP(6) WITH TIME ZONE,
 
-    -- Audit time for row creation.
+    -- Audit timestamp for row creation.
     CREATED_TIME            TIMESTAMP(6) WITH TIME ZONE
                                 DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
 
-    -- Audit time of the most recent SMS row update.
+    -- Audit timestamp for latest row update.
     UPDATED_TIME            TIMESTAMP(6) WITH TIME ZONE
                                 DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
 
     CONSTRAINT PK_PASSKEY_SMS_SCHEDULE
         PRIMARY KEY (SMS_SCHEDULE_ID),
 
-    -- Prevents duplicate SMS sequence rows for the same cooling cycle/customer.
+    -- Prevent duplicate 0h/15h/30h/46h rows within the same cooling cycle.
     CONSTRAINT UK_SMS_CYCLE_SEQUENCE
         UNIQUE (CUST_ID, COOLING_START_TIME, SMS_SEQUENCE),
 
@@ -213,30 +217,45 @@ CREATE TABLE PASSKEY_SMS_SCHEDULE
         CHECK (SMS_SEQUENCE IN (1, 2, 3, 4)),
 
     CONSTRAINT CK_SMS_STATUS
-        CHECK (SMS_STATUS IN
-               ('PENDING', 'QUEUED', 'PROCESSING', 'SENT', 'CANCELLED', 'FAILED'))
+        CHECK
+        (
+            SMS_STATUS IN
+            ('PENDING', 'QUEUED', 'PROCESSING', 'SENT', 'CANCELLED', 'FAILED')
+        ),
+
+    CONSTRAINT CK_SMS_ATTEMPT_COUNT
+        CHECK (ATTEMPT_COUNT >= 0)
 );
 
--- Supports fast cooling-period checks for a customer.
-CREATE INDEX IDX_PENDING_CUSTOMER_COOLING
-    ON PASSKEY_PENDING_VERIFICATION (CUST_ID, COOLING_END_TIME);
+-- ============================================================================
+-- INDEXES
+-- Primary-key and unique constraints already create indexes for:
+--   ACTIVE_PASSKEY(CUST_ID)
+--   PASSKEY_PENDING_VERIFICATION(CUST_ID)
+--   PASSKEY_ARCHIVAL(ARCHIVAL_ID)
+--   PASSKEY_SMS_SCHEDULE(SMS_SCHEDULE_ID)
+--   PASSKEY_SMS_SCHEDULE(CUST_ID, COOLING_START_TIME, SMS_SEQUENCE)
+-- The indexes below support additional access patterns only.
+-- ============================================================================
 
--- Supports customer archive-history lookup in reverse chronological order.
+-- Efficiently finds all customers whose cooling period has completed.
+CREATE INDEX IDX_PENDING_COOLING_END
+    ON PASSKEY_PENDING_VERIFICATION (COOLING_END_TIME);
+
+-- Customer archive-history lookup ordered/filterable by archive time.
 CREATE INDEX IDX_ARCHIVAL_CUSTOMER_TIME
     ON PASSKEY_ARCHIVAL (CUST_ID, ARCHIVED_TIME);
 
--- Main scheduler index for scanning pending SMS by scheduled time.
-CREATE INDEX IDX_SMS_STATUS_SCHEDULE_TIME
-    ON PASSKEY_SMS_SCHEDULE (SMS_STATUS, SCHEDULED_TIME);
+-- Scheduler scans use exactly NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME), so a
+-- function-based index supports both original schedules and retries efficiently.
+CREATE INDEX IDX_SMS_STATUS_DUE_TIME
+    ON PASSKEY_SMS_SCHEDULE
+       (SMS_STATUS, NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME));
 
--- Supports cancellation and history lookup for one customer/cooling cycle.
+-- Supports cancellation/revalidation for one customer's exact cooling cycle.
 CREATE INDEX IDX_SMS_CUSTOMER_CYCLE_STATUS
     ON PASSKEY_SMS_SCHEDULE (CUST_ID, COOLING_START_TIME, SMS_STATUS);
 
 -- Supports customer SMS history queries.
-CREATE INDEX IDX_SMS_CUSTOMER_TIME
+CREATE INDEX IDX_SMS_CUSTOMER_CREATED_TIME
     ON PASSKEY_SMS_SCHEDULE (CUST_ID, CREATED_TIME);
-
--- Supports retry scans when NEXT_ATTEMPT_TIME is populated.
-CREATE INDEX IDX_SMS_NEXT_ATTEMPT
-    ON PASSKEY_SMS_SCHEDULE (SMS_STATUS, NEXT_ATTEMPT_TIME);

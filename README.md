@@ -1,6 +1,6 @@
 # GitSqlRepository
 
-Oracle 19c SQL scripts for passkey verification, a 48-hour cooling period, archival, and scheduled SMS delivery.
+Oracle 19c SQL scripts for passkey verification, a 48-hour cooling period, archival, scheduled SMS delivery, and JDBC integration.
 
 ## Structure
 
@@ -11,6 +11,8 @@ passkey/
 ├── dml/
 │   ├── 02_passkey_scenario_queries.sql
 │   └── 04_audit_queries.sql
+├── jdbc/
+│   └── 05_jdbc_queries.sql
 └── scheduler/
     └── 03_sms_scheduler_queries.sql
 ```
@@ -33,7 +35,7 @@ GENERATED ALWAYS AS IDENTITY
 (START WITH 1 INCREMENT BY 1 CACHE 100 NOCYCLE)
 ```
 
-They are technical surrogate keys with no business meaning. Java must not generate or provide these values. The previous explicit archive/SMS sequences are therefore no longer required.
+They are technical surrogate keys with no business meaning. Java must not generate or provide these values.
 
 ## Archive reason codes
 
@@ -44,13 +46,43 @@ They are technical surrogate keys with no business meaning. Java must not genera
 | `AR103` | PENDING_VERIFICATION | PENDING hash replaced by another different hash while cooling was still active. |
 | `AR104` | PENDING_VERIFICATION | PENDING hash replaced by another different hash after the previous cooling period completed. |
 
-The DDL enforces the valid `SOURCE_TYPE + ARCHIVE_REASON` combinations with a check constraint.
+The DDL enforces the valid `SOURCE_TYPE + ARCHIVE_REASON` combinations.
 
 ## Time handling
 
-All schema timestamps use `TIMESTAMP(6) WITH TIME ZONE`. DML and scheduler queries explicitly use UTC with `SYSTIMESTAMP AT TIME ZONE 'UTC'` so cooling and SMS intervals are based on one consistent time standard.
+All schema timestamps use `TIMESTAMP(6) WITH TIME ZONE`. DML, JDBC and scheduler queries explicitly use UTC with `SYSTIMESTAMP AT TIME ZONE 'UTC'`.
 
-When a new PENDING record is created, one UTC timestamp is selected and reused for both `COOLING_START_TIME` and `COOLING_END_TIME = start + 48 hours`. SMS due times are derived from the stored cooling start rather than independently calling the clock.
+When a new PENDING record is created, one UTC timestamp is selected and reused for both `COOLING_START_TIME` and `COOLING_END_TIME = start + 48 hours`. SMS due times are derived from the stored cooling start.
+
+## JDBC query file
+
+`passkey/jdbc/05_jdbc_queries.sql` contains the SQL intended to be copied into Java/JDBC repository/DAO classes.
+
+The JDBC file uses positional `?` placeholders rather than named bind variables and documents, for every statement:
+
+- exact PreparedStatement parameter order;
+- expected query/update row count;
+- whether the query is read-only or part of a transaction;
+- which business scenario uses it;
+- lock ordering requirements.
+
+For state-changing scenarios Java should use:
+
+```java
+connection.setAutoCommit(false);
+```
+
+and call `commit()` only after every mandatory statement returns the expected result. Any SQL error or unexpected mandatory row count should result in `rollback()`.
+
+### JDBC transaction summary
+
+- Scenarios 2/3: read ACTIVE, then insert first ACTIVE if absent.
+- Scenario 5: lock ACTIVE, confirm no PENDING, insert PENDING, insert four SMS rows.
+- Scenario 6: lock ACTIVE/PENDING, archive PENDING as `AR102`, cancel unsent SMS, delete PENDING.
+- Scenario 7: read-only; no DML while same pending hash is retried within cooling.
+- Scenario 8: archive old PENDING as `AR103`, cancel/delete old cycle, create new PENDING and four SMS rows.
+- Scenario 9: archive ACTIVE as `AR101`, promote matching PENDING only after cooling, cancel remaining SMS, delete PENDING.
+- Scenario 10: archive old PENDING as `AR104`, cancel/delete old cycle, create a fresh 48-hour cycle.
 
 ## Transaction and concurrency rules
 
@@ -73,13 +105,12 @@ The scheduler scan uses:
 NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME)
 ```
 
-The schema includes a matching function-based index so both original scheduled sends and retry sends can be found efficiently. `FOR UPDATE SKIP LOCKED` allows multiple scheduler instances to scan without claiming the same row.
+The schema includes a matching function-based index. `FOR UPDATE SKIP LOCKED` allows multiple scheduler instances to scan without claiming the same row.
 
 ## Execution order
 
 1. Run `passkey/ddl/01_passkey_schema.sql`.
-2. Implement the Java transaction flows documented in `passkey/dml/02_passkey_scenario_queries.sql`.
-3. Use `passkey/scheduler/03_sms_scheduler_queries.sql` for the database scanner and Java `DelayQueue` worker.
-4. Use `passkey/dml/04_audit_queries.sql` for support and operational monitoring.
-
-Bind variables use `:name` notation for readability and should be converted to JDBC placeholders or named parameters by the application.
+2. Use `passkey/jdbc/05_jdbc_queries.sql` for Java/JDBC implementation.
+3. Use `passkey/dml/02_passkey_scenario_queries.sql` as the named-bind/reference version of the business SQL.
+4. Use `passkey/scheduler/03_sms_scheduler_queries.sql` for the database scanner and Java `DelayQueue` worker.
+5. Use `passkey/dml/04_audit_queries.sql` for support and operational monitoring.

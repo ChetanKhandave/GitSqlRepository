@@ -3,8 +3,8 @@
 --
 -- Time-storage rule:
 --   All date/time columns use plain TIMESTAMP(6), without a time-zone component.
---   Values are stored in UTC. Oracle generates UTC values with
---   SYS_EXTRACT_UTC(SYSTIMESTAMP), which returns a plain TIMESTAMP.
+--   No UTC conversion or time-zone conversion is performed.
+--   Oracle-generated current time uses LOCALTIMESTAMP, which returns TIMESTAMP.
 --
 -- Design principles:
 --   1. ACTIVE_PASSKEY stores only the currently trusted passkey.
@@ -35,9 +35,9 @@ CREATE TABLE ACTIVE_PASSKEY
     COOLING_START_TIME  TIMESTAMP(6),
     COOLING_END_TIME    TIMESTAMP(6),
 
-    -- Plain UTC timestamp of the latest ACTIVE state change.
+    -- Plain timestamp of the latest ACTIVE state change.
     UPDATED_TIME        TIMESTAMP(6)
-                            DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+                            DEFAULT LOCALTIMESTAMP NOT NULL,
 
     CONSTRAINT PK_ACTIVE_PASSKEY
         PRIMARY KEY (CUST_ID),
@@ -99,9 +99,9 @@ CREATE TABLE PASSKEY_ARCHIVAL
 
     ARCHIVE_REASON              VARCHAR2(10 CHAR) NOT NULL,
 
-    -- Plain UTC timestamp of archival.
+    -- Plain timestamp of archival.
     ARCHIVED_TIME               TIMESTAMP(6)
-                                    DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+                                    DEFAULT LOCALTIMESTAMP NOT NULL,
 
     CONSTRAINT PK_PASSKEY_ARCHIVAL
         PRIMARY KEY (ARCHIVAL_ID),
@@ -165,9 +165,9 @@ CREATE TABLE PASSKEY_SMS_SCHEDULE
     LOCKED_BY               VARCHAR2(100 CHAR),
     LOCKED_TIME             TIMESTAMP(6),
     CREATED_TIME            TIMESTAMP(6)
-                                DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+                                DEFAULT LOCALTIMESTAMP NOT NULL,
     UPDATED_TIME            TIMESTAMP(6)
-                                DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+                                DEFAULT LOCALTIMESTAMP NOT NULL,
 
     CONSTRAINT PK_PASSKEY_SMS_SCHEDULE
         PRIMARY KEY (SMS_SCHEDULE_ID),

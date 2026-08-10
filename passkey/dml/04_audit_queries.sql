@@ -1,12 +1,10 @@
 -- ============================================================================
 -- Support and audit queries for the passkey schema.
 -- Avoid exposing full passkey hashes in operational UIs or application logs.
--- All current-time comparisons use UTC.
+-- All stored timestamps are plain TIMESTAMP(6) values representing UTC.
 -- ============================================================================
 
 -- Current ACTIVE and PENDING state for one customer.
--- ACTIVE_COOLING_* is historical provenance for how the current ACTIVE hash was
--- activated. It is NULL for first-registration hashes.
 SELECT A.CUST_ID,
        A.MOBILE_NUMBER,
        A.PASSKEY_HASH AS ACTIVE_HASH,
@@ -18,7 +16,7 @@ SELECT A.CUST_ID,
        P.COOLING_END_TIME AS PENDING_COOLING_END_TIME,
        CASE
            WHEN P.COOLING_END_TIME IS NULL THEN 'NOT_APPLICABLE'
-           WHEN (SYSTIMESTAMP AT TIME ZONE 'UTC') < P.COOLING_END_TIME
+           WHEN SYS_EXTRACT_UTC(SYSTIMESTAMP) < P.COOLING_END_TIME
                THEN 'ACTIVE'
            ELSE 'COMPLETED'
        END AS PENDING_COOLING_STATUS
@@ -27,8 +25,7 @@ LEFT JOIN PASSKEY_PENDING_VERIFICATION P
   ON P.CUST_ID = A.CUST_ID
 WHERE A.CUST_ID = :custId;
 
--- Complete archive history. For ACTIVE source, ORIGINAL_COOLING_* describes the
--- cooling window through which that archived hash originally became ACTIVE.
+-- Complete archive history for one customer.
 SELECT ARCHIVAL_ID,
        CUST_ID,
        SOURCE_TYPE,
@@ -65,7 +62,7 @@ SELECT CUST_ID,
        COOLING_START_TIME,
        COOLING_END_TIME
 FROM PASSKEY_PENDING_VERIFICATION
-WHERE (SYSTIMESTAMP AT TIME ZONE 'UTC') >= COOLING_END_TIME
+WHERE SYS_EXTRACT_UTC(SYSTIMESTAMP) >= COOLING_END_TIME
 ORDER BY COOLING_END_TIME;
 
 -- Scheduler backlog summary.
@@ -88,5 +85,5 @@ SELECT SMS_SCHEDULE_ID,
 FROM PASSKEY_SMS_SCHEDULE
 WHERE SMS_STATUS = 'PENDING'
   AND NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME)
-      < (SYSTIMESTAMP AT TIME ZONE 'UTC')
+      < SYS_EXTRACT_UTC(SYSTIMESTAMP)
 ORDER BY NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME);

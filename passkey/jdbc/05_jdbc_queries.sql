@@ -1,20 +1,13 @@
 -- ============================================================================
 -- JDBC-ready Oracle 19c SQL for the passkey feature.
---
--- IMPORTANT JDBC NOTES
---   1. All bind parameters use positional '?' placeholders.
---   2. Parameter order is documented above every statement.
---   3. Hash comparison is performed in Java. Scenario 9 also verifies the
---      incoming hash in SQL as defense-in-depth before promotion.
---   4. Use Connection#setAutoCommit(false) for state-changing scenarios.
---   5. Commit only after every statement in the scenario succeeds.
---   6. Roll back the complete transaction on failure/unexpected row count.
---   7. When both rows are required, lock ACTIVE first and then PENDING.
+-- ACTIVE_PASSKEY retains the cooling window through which the current hash
+-- became active. The two cooling columns are NULL for first registration.
 -- ============================================================================
 
 -- JQ01 - READ ACTIVE PASSKEY
 -- Parameters: 1=CUST_ID. Expected result: 0 or 1 row.
-SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH, UPDATED_TIME
+SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
+       COOLING_START_TIME, COOLING_END_TIME, UPDATED_TIME
 FROM ACTIVE_PASSKEY
 WHERE CUST_ID = ?;
 
@@ -27,13 +20,14 @@ WHERE CUST_ID = ?;
 
 -- JQ03 - LOCK ACTIVE PASSKEY
 -- Parameters: 1=CUST_ID. Expected result: 1 row when ACTIVE exists.
-SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH, UPDATED_TIME
+SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
+       COOLING_START_TIME, COOLING_END_TIME, UPDATED_TIME
 FROM ACTIVE_PASSKEY
 WHERE CUST_ID = ?
 FOR UPDATE;
 
 -- JQ04 - LOCK PENDING PASSKEY
--- Lock only after JQ03 to keep a consistent lock order.
+-- Lock only after JQ03.
 -- Parameters: 1=CUST_ID. Expected result: 0 or 1 row.
 SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
        COOLING_START_TIME, COOLING_END_TIME
@@ -42,14 +36,15 @@ WHERE CUST_ID = ?
 FOR UPDATE;
 
 -- JQ05 - INSERT FIRST ACTIVE PASSKEY (Scenarios 2/3)
+-- First registration has no cooling history, so both cooling values are NULL.
 -- Parameters: 1=CUST_ID, 2=MOBILE_NUMBER, 3=PASSKEY_HASH.
 -- Expected update count: 1.
 INSERT INTO ACTIVE_PASSKEY
-(CUST_ID, MOBILE_NUMBER, PASSKEY_HASH, UPDATED_TIME)
-VALUES (?, ?, ?, SYSTIMESTAMP AT TIME ZONE 'UTC');
+(CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
+ COOLING_START_TIME, COOLING_END_TIME, UPDATED_TIME)
+VALUES (?, ?, ?, NULL, NULL, SYSTIMESTAMP AT TIME ZONE 'UTC');
 
 -- JQ06 - INSERT NEW PENDING PASSKEY (Scenarios 5/8/10)
--- Generates COOLING_START_TIME once in Oracle and derives +48 hours from it.
 -- Parameters: 1=CUST_ID, 2=PASSKEY_HASH, 3=MOBILE_NUMBER.
 -- Expected update count: 1.
 INSERT INTO PASSKEY_PENDING_VERIFICATION
@@ -60,9 +55,7 @@ FROM (
     FROM DUAL
 );
 
--- JQ07 - INSERT FOUR SMS SCHEDULE ROWS FOR THE CURRENT PENDING CYCLE
--- SMS 1=immediate, 2=+15h, 3=+30h, 4=+46h.
--- SMS_SCHEDULE_ID is GENERATED ALWAYS AS IDENTITY.
+-- JQ07 - INSERT FOUR SMS SCHEDULE ROWS
 -- Parameters: 1=CUST_ID. Expected update count: 4.
 INSERT INTO PASSKEY_SMS_SCHEDULE
 (CUST_ID, MOBILE_NUMBER, COOLING_START_TIME, SMS_SEQUENCE,
@@ -96,8 +89,6 @@ CROSS JOIN (
 WHERE P.CUST_ID = ?;
 
 -- JQ08 - ARCHIVE CURRENT PENDING PASSKEY
--- AR102=ACTIVE reconfirmed; AR103=replaced during cooling;
--- AR104=replaced after cooling. ARCHIVAL_ID is identity-generated.
 -- Parameters: 1=ARCHIVE_REASON, 2=CUST_ID. Expected update count: 1.
 INSERT INTO PASSKEY_ARCHIVAL
 (CUST_ID, PASSKEY_HASH, SOURCE_TYPE,
@@ -113,16 +104,19 @@ SELECT CUST_ID,
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = ?;
 
--- JQ09 - ARCHIVE CURRENT ACTIVE PASSKEY AS AR101 (Scenario 9)
--- Archives ACTIVE only if the incoming hash matches PENDING and cooling ended.
+-- JQ09 - ARCHIVE CURRENT ACTIVE PASSKEY AS AR101
+-- Copies the ACTIVE hash's own historical cooling window before replacement.
 -- Parameters: 1=CUST_ID, 2=INCOMING_HASH. Expected update count: 1.
 INSERT INTO PASSKEY_ARCHIVAL
 (CUST_ID, PASSKEY_HASH, SOURCE_TYPE,
- ORIGINAL_UPDATED_TIME, ARCHIVE_REASON, ARCHIVED_TIME)
+ ORIGINAL_UPDATED_TIME, ORIGINAL_COOLING_START_TIME,
+ ORIGINAL_COOLING_END_TIME, ARCHIVE_REASON, ARCHIVED_TIME)
 SELECT A.CUST_ID,
        A.PASSKEY_HASH,
        'ACTIVE',
        A.UPDATED_TIME,
+       A.COOLING_START_TIME,
+       A.COOLING_END_TIME,
        'AR101',
        SYSTIMESTAMP AT TIME ZONE 'UTC'
 FROM ACTIVE_PASSKEY A
@@ -135,15 +129,22 @@ WHERE A.CUST_ID = ?
         AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
   );
 
--- JQ10 - PROMOTE PENDING HASH TO ACTIVE (Scenario 9)
--- SQL again verifies incoming hash and cooling completion.
+-- JQ10 - PROMOTE PENDING HASH TO ACTIVE
+-- Copies both cooling timestamps from PENDING to ACTIVE so activation history
+-- remains available after the PENDING row is deleted.
 -- Parameters: 1=INCOMING_HASH, 2=CUST_ID, 3=INCOMING_HASH.
--- Expected update count: 1; otherwise roll back.
+-- Expected update count: 1.
 UPDATE ACTIVE_PASSKEY A
-SET (A.PASSKEY_HASH, A.MOBILE_NUMBER, A.UPDATED_TIME) =
+SET (A.PASSKEY_HASH,
+     A.MOBILE_NUMBER,
+     A.COOLING_START_TIME,
+     A.COOLING_END_TIME,
+     A.UPDATED_TIME) =
     (
         SELECT P.PASSKEY_HASH,
                P.MOBILE_NUMBER,
+               P.COOLING_START_TIME,
+               P.COOLING_END_TIME,
                SYSTIMESTAMP AT TIME ZONE 'UTC'
         FROM PASSKEY_PENDING_VERIFICATION P
         WHERE P.CUST_ID = A.CUST_ID
@@ -160,7 +161,6 @@ WHERE A.CUST_ID = ?
   );
 
 -- JQ11 - CANCEL UNSENT SMS FOR ONE COOLING CYCLE
--- SENT rows remain for audit. PROCESSING rows require provider-aware handling.
 -- Parameters: 1=CANCEL_REASON, 2=CUST_ID, 3=COOLING_START_TIME.
 -- Expected update count: 0..4.
 UPDATE PASSKEY_SMS_SCHEDULE
@@ -175,9 +175,11 @@ WHERE CUST_ID = ?
   AND SMS_STATUS IN ('PENDING', 'QUEUED');
 
 -- JQ12 - DELETE CURRENT PENDING ROW
--- Parameters: 1=CUST_ID. Expected update count: 1 for Scenarios 6/8/9/10.
+-- Use exact cooling start to avoid deleting a replacement cycle accidentally.
+-- Parameters: 1=CUST_ID, 2=COOLING_START_TIME. Expected update count: 1.
 DELETE FROM PASSKEY_PENDING_VERIFICATION
-WHERE CUST_ID = ?;
+WHERE CUST_ID = ?
+  AND COOLING_START_TIME = ?;
 
 -- JQ13 - READ COOLING STATUS
 -- Parameters: 1=CUST_ID. Expected result: 0 or 1 row.
@@ -194,43 +196,17 @@ SELECT CUST_ID,
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = ?;
 
--- ============================================================================
--- JDBC TRANSACTION FLOW BY BUSINESS SCENARIO
--- ============================================================================
--- Scenario 1:
---   No SQL.
---
--- Scenarios 2/3:
---   JQ01 -> if no ACTIVE, JQ05 (expect 1) -> COMMIT.
---
--- Scenario 4:
---   JQ01 -> compare incomingHash with ACTIVE in Java.
---   JQ02 -> if no PENDING, no DML. If PENDING exists, use Scenario 6 flow.
---
--- Scenario 5 (first mismatch):
---   BEGIN TX -> JQ03 -> JQ04(confirm no PENDING) -> JQ06(expect 1)
---   -> JQ07(expect 4) -> COMMIT.
---
--- Scenario 6 (ACTIVE hash used while PENDING exists):
---   BEGIN TX -> JQ03 -> JQ04(save COOLING_START_TIME)
---   -> JQ08(AR102, expect 1) -> JQ11 -> JQ12(expect 1) -> COMMIT.
---
--- Scenario 7 (same PENDING hash during cooling):
---   JQ01 + JQ13. If incomingHash matches PENDING and status=ACTIVE, no DML.
---
--- Scenario 8 (different hash during cooling):
---   BEGIN TX -> JQ03 -> JQ04(save old COOLING_START_TIME)
---   -> JQ08(AR103, expect 1) -> JQ11 -> JQ12(expect 1)
---   -> JQ06(expect 1) -> JQ07(expect 4) -> COMMIT.
---
--- Scenario 9 (matching PENDING hash after cooling):
---   BEGIN TX -> JQ03 -> JQ04(save COOLING_START_TIME)
---   -> verify hash/cooling in Java -> JQ09(expect 1) -> JQ10(expect 1)
---   -> JQ11 -> JQ12(expect 1) -> COMMIT.
---
--- Scenario 10 (different hash after cooling):
---   BEGIN TX -> JQ03 -> JQ04(save old COOLING_START_TIME)
---   -> JQ08(AR104, expect 1) -> JQ11 -> JQ12(expect 1)
---   -> JQ06(expect 1) -> JQ07(expect 4) -> COMMIT.
---
--- Any failed statement or unexpected mandatory update count => ROLLBACK.
+-- JDBC TRANSACTION FLOW -------------------------------------------------------
+-- Scenarios 2/3: JQ01 -> JQ05 -> COMMIT.
+-- Scenario 5: JQ03 -> JQ04(no pending) -> JQ06 -> JQ07 -> COMMIT.
+-- Scenario 6: JQ03 -> JQ04(save cooling start) -> JQ08(AR102)
+--             -> JQ11 -> JQ12 -> COMMIT.
+-- Scenario 7: JQ01 + JQ13; no DML when same pending hash during cooling.
+-- Scenario 8: JQ03 -> JQ04 -> JQ08(AR103) -> JQ11 -> JQ12
+--             -> JQ06 -> JQ07 -> COMMIT.
+-- Scenario 9: JQ03 -> JQ04 -> JQ09 -> JQ10 -> JQ11 -> JQ12 -> COMMIT.
+--             JQ09 archives ACTIVE's previous cooling history; JQ10 copies the
+--             promoted PENDING cooling history into ACTIVE.
+-- Scenario 10: JQ03 -> JQ04 -> JQ08(AR104) -> JQ11 -> JQ12
+--              -> JQ06 -> JQ07 -> COMMIT.
+-- Any unexpected mandatory row count => ROLLBACK.

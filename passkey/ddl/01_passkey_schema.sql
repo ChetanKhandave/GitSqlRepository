@@ -1,6 +1,11 @@
 -- ============================================================================
 -- Oracle 19c schema for passkey verification and scheduled SMS delivery.
 --
+-- Time-storage rule:
+--   All date/time columns use plain TIMESTAMP(6), without a time-zone component.
+--   Values are stored in UTC. Oracle generates UTC values with
+--   SYS_EXTRACT_UTC(SYSTIMESTAMP), which returns a plain TIMESTAMP.
+--
 -- Design principles:
 --   1. ACTIVE_PASSKEY stores only the currently trusted passkey.
 --   2. ACTIVE_PASSKEY also retains the cooling window through which the current
@@ -11,7 +16,6 @@
 --   5. PASSKEY_SMS_SCHEDULE stores SMS timing/delivery state independently.
 --   6. ARCHIVAL_ID and SMS_SCHEDULE_ID are technical surrogate keys generated
 --      by Oracle identity columns; Java never supplies these values.
---   7. All timestamps use TIMESTAMP WITH TIME ZONE and DML uses UTC explicitly.
 -- ============================================================================
 
 -- ============================================================================
@@ -22,29 +26,22 @@
 -- ============================================================================
 CREATE TABLE ACTIVE_PASSKEY
 (
-    -- Unique customer identifier. Primary key guarantees one active row/customer.
     CUST_ID             VARCHAR2(20 CHAR) NOT NULL,
-
-    -- Registered mobile number associated with the active passkey/customer.
     MOBILE_NUMBER       VARCHAR2(20 CHAR) NOT NULL,
-
-    -- Current trusted passkey hash received from frontend.
     PASSKEY_HASH        VARCHAR2(150 CHAR) NOT NULL,
 
-    -- Cooling window through which the current ACTIVE hash was promoted.
+    -- Historical cooling window for the current ACTIVE hash.
     -- Both values are NULL when the hash became ACTIVE on first registration.
-    COOLING_START_TIME  TIMESTAMP(6) WITH TIME ZONE,
-    COOLING_END_TIME    TIMESTAMP(6) WITH TIME ZONE,
+    COOLING_START_TIME  TIMESTAMP(6),
+    COOLING_END_TIME    TIMESTAMP(6),
 
-    -- UTC time at which the active row was inserted or its active state updated.
-    UPDATED_TIME        TIMESTAMP(6) WITH TIME ZONE
-                            DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
+    -- Plain UTC timestamp of the latest ACTIVE state change.
+    UPDATED_TIME        TIMESTAMP(6)
+                            DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
 
     CONSTRAINT PK_ACTIVE_PASSKEY
         PRIMARY KEY (CUST_ID),
 
-    -- Either no historical cooling window exists, or both timestamps exist and
-    -- form a valid positive interval.
     CONSTRAINT CK_ACTIVE_COOLING_TIME
         CHECK
         (
@@ -65,8 +62,8 @@ CREATE TABLE PASSKEY_PENDING_VERIFICATION
     CUST_ID             VARCHAR2(20 CHAR) NOT NULL,
     PASSKEY_HASH        VARCHAR2(150 CHAR) NOT NULL,
     MOBILE_NUMBER       VARCHAR2(20 CHAR) NOT NULL,
-    COOLING_START_TIME  TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    COOLING_END_TIME    TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+    COOLING_START_TIME  TIMESTAMP(6) NOT NULL,
+    COOLING_END_TIME    TIMESTAMP(6) NOT NULL,
 
     CONSTRAINT PK_PENDING_VERIFICATION
         PRIMARY KEY (CUST_ID),
@@ -96,19 +93,15 @@ CREATE TABLE PASSKEY_ARCHIVAL
     PASSKEY_HASH                VARCHAR2(150 CHAR) NOT NULL,
     SOURCE_TYPE                 VARCHAR2(30 CHAR) NOT NULL,
 
-    -- For ACTIVE source: original ACTIVE_PASSKEY.UPDATED_TIME.
-    ORIGINAL_UPDATED_TIME       TIMESTAMP(6) WITH TIME ZONE,
-
-    -- For ACTIVE source: cooling window through which that hash became ACTIVE.
-    -- For PENDING source: cooling window of the pending verification attempt.
-    -- These values may be NULL only for an ACTIVE hash created on first registration.
-    ORIGINAL_COOLING_START_TIME TIMESTAMP(6) WITH TIME ZONE,
-    ORIGINAL_COOLING_END_TIME   TIMESTAMP(6) WITH TIME ZONE,
+    ORIGINAL_UPDATED_TIME       TIMESTAMP(6),
+    ORIGINAL_COOLING_START_TIME TIMESTAMP(6),
+    ORIGINAL_COOLING_END_TIME   TIMESTAMP(6),
 
     ARCHIVE_REASON              VARCHAR2(10 CHAR) NOT NULL,
 
-    ARCHIVED_TIME               TIMESTAMP(6) WITH TIME ZONE
-                                    DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
+    -- Plain UTC timestamp of archival.
+    ARCHIVED_TIME               TIMESTAMP(6)
+                                    DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
 
     CONSTRAINT PK_PASSKEY_ARCHIVAL
         PRIMARY KEY (ARCHIVAL_ID),
@@ -128,7 +121,6 @@ CREATE TABLE PASSKEY_ARCHIVAL
              AND SOURCE_TYPE = 'PENDING_VERIFICATION')
         ),
 
-    -- Cooling timestamps, when present, must be a complete valid pair.
     CONSTRAINT CK_ARCHIVAL_COOLING_TIME
         CHECK
         (
@@ -158,24 +150,24 @@ CREATE TABLE PASSKEY_SMS_SCHEDULE
 
     CUST_ID                 VARCHAR2(20 CHAR) NOT NULL,
     MOBILE_NUMBER           VARCHAR2(20 CHAR) NOT NULL,
-    COOLING_START_TIME      TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+    COOLING_START_TIME      TIMESTAMP(6) NOT NULL,
     SMS_SEQUENCE            NUMBER(1) NOT NULL,
-    SCHEDULED_TIME          TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    NEXT_ATTEMPT_TIME       TIMESTAMP(6) WITH TIME ZONE,
+    SCHEDULED_TIME          TIMESTAMP(6) NOT NULL,
+    NEXT_ATTEMPT_TIME       TIMESTAMP(6),
     SMS_STATUS              VARCHAR2(20 CHAR) DEFAULT 'PENDING' NOT NULL,
-    QUEUED_TIME             TIMESTAMP(6) WITH TIME ZONE,
-    PROCESSING_START_TIME   TIMESTAMP(6) WITH TIME ZONE,
-    SENT_TIME               TIMESTAMP(6) WITH TIME ZONE,
-    CANCELLED_TIME          TIMESTAMP(6) WITH TIME ZONE,
+    QUEUED_TIME             TIMESTAMP(6),
+    PROCESSING_START_TIME   TIMESTAMP(6),
+    SENT_TIME               TIMESTAMP(6),
+    CANCELLED_TIME          TIMESTAMP(6),
     CANCEL_REASON           VARCHAR2(60 CHAR),
     ATTEMPT_COUNT           NUMBER DEFAULT 0 NOT NULL,
     LAST_ERROR_MESSAGE      VARCHAR2(1000 CHAR),
     LOCKED_BY               VARCHAR2(100 CHAR),
-    LOCKED_TIME             TIMESTAMP(6) WITH TIME ZONE,
-    CREATED_TIME            TIMESTAMP(6) WITH TIME ZONE
-                                DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
-    UPDATED_TIME            TIMESTAMP(6) WITH TIME ZONE
-                                DEFAULT (SYSTIMESTAMP AT TIME ZONE 'UTC') NOT NULL,
+    LOCKED_TIME             TIMESTAMP(6),
+    CREATED_TIME            TIMESTAMP(6)
+                                DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    UPDATED_TIME            TIMESTAMP(6)
+                                DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
 
     CONSTRAINT PK_PASSKEY_SMS_SCHEDULE
         PRIMARY KEY (SMS_SCHEDULE_ID),

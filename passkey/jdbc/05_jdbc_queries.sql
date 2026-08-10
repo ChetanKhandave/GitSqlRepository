@@ -1,7 +1,10 @@
 -- ============================================================================
 -- JDBC-ready Oracle 19c SQL for the passkey feature.
--- ACTIVE_PASSKEY retains the cooling window through which the current hash
--- became active. The two cooling columns are NULL for first registration.
+--
+-- Time rule:
+--   All database time columns are plain TIMESTAMP(6).
+--   All stored values represent UTC.
+--   Oracle-generated current time uses SYS_EXTRACT_UTC(SYSTIMESTAMP).
 -- ============================================================================
 
 -- JQ01 - READ ACTIVE PASSKEY
@@ -19,7 +22,6 @@ FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = ?;
 
 -- JQ03 - LOCK ACTIVE PASSKEY
--- Parameters: 1=CUST_ID. Expected result: 1 row when ACTIVE exists.
 SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
        COOLING_START_TIME, COOLING_END_TIME, UPDATED_TIME
 FROM ACTIVE_PASSKEY
@@ -28,7 +30,6 @@ FOR UPDATE;
 
 -- JQ04 - LOCK PENDING PASSKEY
 -- Lock only after JQ03.
--- Parameters: 1=CUST_ID. Expected result: 0 or 1 row.
 SELECT CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
        COOLING_START_TIME, COOLING_END_TIME
 FROM PASSKEY_PENDING_VERIFICATION
@@ -36,13 +37,12 @@ WHERE CUST_ID = ?
 FOR UPDATE;
 
 -- JQ05 - INSERT FIRST ACTIVE PASSKEY (Scenarios 2/3)
--- First registration has no cooling history, so both cooling values are NULL.
 -- Parameters: 1=CUST_ID, 2=MOBILE_NUMBER, 3=PASSKEY_HASH.
 -- Expected update count: 1.
 INSERT INTO ACTIVE_PASSKEY
 (CUST_ID, MOBILE_NUMBER, PASSKEY_HASH,
  COOLING_START_TIME, COOLING_END_TIME, UPDATED_TIME)
-VALUES (?, ?, ?, NULL, NULL, SYSTIMESTAMP AT TIME ZONE 'UTC');
+VALUES (?, ?, ?, NULL, NULL, SYS_EXTRACT_UTC(SYSTIMESTAMP));
 
 -- JQ06 - INSERT NEW PENDING PASSKEY (Scenarios 5/8/10)
 -- Parameters: 1=CUST_ID, 2=PASSKEY_HASH, 3=MOBILE_NUMBER.
@@ -51,7 +51,7 @@ INSERT INTO PASSKEY_PENDING_VERIFICATION
 (CUST_ID, PASSKEY_HASH, MOBILE_NUMBER, COOLING_START_TIME, COOLING_END_TIME)
 SELECT ?, ?, ?, UTC_NOW, UTC_NOW + NUMTODSINTERVAL(48, 'HOUR')
 FROM (
-    SELECT SYSTIMESTAMP AT TIME ZONE 'UTC' AS UTC_NOW
+    SELECT SYS_EXTRACT_UTC(SYSTIMESTAMP) AS UTC_NOW
     FROM DUAL
 );
 
@@ -77,8 +77,8 @@ SELECT P.CUST_ID,
            WHEN 4 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(46, 'HOUR')
        END,
        'PENDING',
-       SYSTIMESTAMP AT TIME ZONE 'UTC',
-       SYSTIMESTAMP AT TIME ZONE 'UTC'
+       SYS_EXTRACT_UTC(SYSTIMESTAMP),
+       SYS_EXTRACT_UTC(SYSTIMESTAMP)
 FROM PASSKEY_PENDING_VERIFICATION P
 CROSS JOIN (
     SELECT 1 AS SMS_SEQUENCE FROM DUAL
@@ -100,12 +100,11 @@ SELECT CUST_ID,
        COOLING_START_TIME,
        COOLING_END_TIME,
        ?,
-       SYSTIMESTAMP AT TIME ZONE 'UTC'
+       SYS_EXTRACT_UTC(SYSTIMESTAMP)
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = ?;
 
 -- JQ09 - ARCHIVE CURRENT ACTIVE PASSKEY AS AR101
--- Copies the ACTIVE hash's own historical cooling window before replacement.
 -- Parameters: 1=CUST_ID, 2=INCOMING_HASH. Expected update count: 1.
 INSERT INTO PASSKEY_ARCHIVAL
 (CUST_ID, PASSKEY_HASH, SOURCE_TYPE,
@@ -118,7 +117,7 @@ SELECT A.CUST_ID,
        A.COOLING_START_TIME,
        A.COOLING_END_TIME,
        'AR101',
-       SYSTIMESTAMP AT TIME ZONE 'UTC'
+       SYS_EXTRACT_UTC(SYSTIMESTAMP)
 FROM ACTIVE_PASSKEY A
 WHERE A.CUST_ID = ?
   AND EXISTS (
@@ -126,12 +125,10 @@ WHERE A.CUST_ID = ?
       FROM PASSKEY_PENDING_VERIFICATION P
       WHERE P.CUST_ID = A.CUST_ID
         AND P.PASSKEY_HASH = ?
-        AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
+        AND SYS_EXTRACT_UTC(SYSTIMESTAMP) >= P.COOLING_END_TIME
   );
 
 -- JQ10 - PROMOTE PENDING HASH TO ACTIVE
--- Copies both cooling timestamps from PENDING to ACTIVE so activation history
--- remains available after the PENDING row is deleted.
 -- Parameters: 1=INCOMING_HASH, 2=CUST_ID, 3=INCOMING_HASH.
 -- Expected update count: 1.
 UPDATE ACTIVE_PASSKEY A
@@ -145,11 +142,11 @@ SET (A.PASSKEY_HASH,
                P.MOBILE_NUMBER,
                P.COOLING_START_TIME,
                P.COOLING_END_TIME,
-               SYSTIMESTAMP AT TIME ZONE 'UTC'
+               SYS_EXTRACT_UTC(SYSTIMESTAMP)
         FROM PASSKEY_PENDING_VERIFICATION P
         WHERE P.CUST_ID = A.CUST_ID
           AND P.PASSKEY_HASH = ?
-          AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
+          AND SYS_EXTRACT_UTC(SYSTIMESTAMP) >= P.COOLING_END_TIME
     )
 WHERE A.CUST_ID = ?
   AND EXISTS (
@@ -157,7 +154,7 @@ WHERE A.CUST_ID = ?
       FROM PASSKEY_PENDING_VERIFICATION P
       WHERE P.CUST_ID = A.CUST_ID
         AND P.PASSKEY_HASH = ?
-        AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
+        AND SYS_EXTRACT_UTC(SYSTIMESTAMP) >= P.COOLING_END_TIME
   );
 
 -- JQ11 - CANCEL UNSENT SMS FOR ONE COOLING CYCLE
@@ -165,17 +162,16 @@ WHERE A.CUST_ID = ?
 -- Expected update count: 0..4.
 UPDATE PASSKEY_SMS_SCHEDULE
 SET SMS_STATUS = 'CANCELLED',
-    CANCELLED_TIME = SYSTIMESTAMP AT TIME ZONE 'UTC',
+    CANCELLED_TIME = SYS_EXTRACT_UTC(SYSTIMESTAMP),
     CANCEL_REASON = ?,
     LOCKED_BY = NULL,
     LOCKED_TIME = NULL,
-    UPDATED_TIME = SYSTIMESTAMP AT TIME ZONE 'UTC'
+    UPDATED_TIME = SYS_EXTRACT_UTC(SYSTIMESTAMP)
 WHERE CUST_ID = ?
   AND COOLING_START_TIME = ?
   AND SMS_STATUS IN ('PENDING', 'QUEUED');
 
 -- JQ12 - DELETE CURRENT PENDING ROW
--- Use exact cooling start to avoid deleting a replacement cycle accidentally.
 -- Parameters: 1=CUST_ID, 2=COOLING_START_TIME. Expected update count: 1.
 DELETE FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = ?
@@ -189,7 +185,7 @@ SELECT CUST_ID,
        COOLING_START_TIME,
        COOLING_END_TIME,
        CASE
-           WHEN (SYSTIMESTAMP AT TIME ZONE 'UTC') < COOLING_END_TIME
+           WHEN SYS_EXTRACT_UTC(SYSTIMESTAMP) < COOLING_END_TIME
                THEN 'ACTIVE'
            ELSE 'COMPLETED'
        END AS COOLING_STATUS
@@ -205,8 +201,6 @@ WHERE CUST_ID = ?;
 -- Scenario 8: JQ03 -> JQ04 -> JQ08(AR103) -> JQ11 -> JQ12
 --             -> JQ06 -> JQ07 -> COMMIT.
 -- Scenario 9: JQ03 -> JQ04 -> JQ09 -> JQ10 -> JQ11 -> JQ12 -> COMMIT.
---             JQ09 archives ACTIVE's previous cooling history; JQ10 copies the
---             promoted PENDING cooling history into ACTIVE.
 -- Scenario 10: JQ03 -> JQ04 -> JQ08(AR104) -> JQ11 -> JQ12
 --              -> JQ06 -> JQ07 -> COMMIT.
 -- Any unexpected mandatory row count => ROLLBACK.

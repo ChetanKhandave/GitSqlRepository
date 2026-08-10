@@ -1,28 +1,23 @@
 -- ============================================================================
 -- Oracle 19c DML templates executed by the Java application.
---
--- Important rules:
---   * Bind variables use :name notation for readability.
---   * Java performs the primary hash comparison and scenario selection.
---   * State-changing scenarios execute inside one JDBC transaction.
---   * ACTIVE is locked before PENDING whenever both can participate in a change.
---   * ARCHIVAL_ID and SMS_SCHEDULE_ID are identity columns. Never supply them.
---   * All current timestamps are generated explicitly in UTC.
+-- Bind variables use :name notation for readability.
+-- ACTIVE is locked before PENDING for state-changing scenarios.
+-- All current timestamps are generated explicitly in UTC.
 -- ============================================================================
 
--- ----------------------------------------------------------------------------
--- COMMON LOOKUPS
--- ----------------------------------------------------------------------------
-
--- Read the currently trusted hash for a customer.
+-- COMMON LOOKUPS -------------------------------------------------------------
+-- Read current ACTIVE state, including the cooling window through which the
+-- current hash became active. Cooling columns are NULL for first registration.
 SELECT CUST_ID,
        MOBILE_NUMBER,
        PASSKEY_HASH,
+       COOLING_START_TIME,
+       COOLING_END_TIME,
        UPDATED_TIME
 FROM ACTIVE_PASSKEY
 WHERE CUST_ID = :custId;
 
--- Read the current pending hash and its 48-hour cooling boundary.
+-- Read current PENDING state.
 SELECT CUST_ID,
        MOBILE_NUMBER,
        PASSKEY_HASH,
@@ -31,17 +26,18 @@ SELECT CUST_ID,
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = :custId;
 
--- Lock ACTIVE before a state-changing scenario.
--- Using the same lock order everywhere reduces deadlock risk.
+-- Lock ACTIVE first.
 SELECT CUST_ID,
        MOBILE_NUMBER,
        PASSKEY_HASH,
+       COOLING_START_TIME,
+       COOLING_END_TIME,
        UPDATED_TIME
 FROM ACTIVE_PASSKEY
 WHERE CUST_ID = :custId
 FOR UPDATE;
 
--- Lock PENDING only after ACTIVE has been locked.
+-- Lock PENDING only after ACTIVE.
 SELECT CUST_ID,
        MOBILE_NUMBER,
        PASSKEY_HASH,
@@ -51,33 +47,22 @@ FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = :custId
 FOR UPDATE;
 
--- ----------------------------------------------------------------------------
--- SCENARIO 1: frontend verification failed
--- ----------------------------------------------------------------------------
--- No SQL operation is required.
--- Java returns authentication failure, shows the existing ETB menu,
--- does not start cooling, does not schedule SMS, and does not report PRM.
+-- SCENARIO 1 -----------------------------------------------------------------
+-- Frontend verification failed: no SQL, no cooling, no SMS, no PRM.
 
--- ----------------------------------------------------------------------------
--- MALFORMED REQUEST
--- ----------------------------------------------------------------------------
--- Validate required fields before database access.
--- Examples: missing CUST_ID, missing mobile number, VERIFIED with null hash,
--- or PASSKEY_HASH length > 150.
--- Return "Unable to serve your request." with no DB/SMS/PRM side effects.
+-- MALFORMED REQUEST -----------------------------------------------------------
+-- Validate in Java before DB access. Return "Unable to serve your request."
 
--- ----------------------------------------------------------------------------
--- SCENARIOS 2 AND 3: first verified passkey
--- ----------------------------------------------------------------------------
--- Used only when no ACTIVE row exists for the customer.
--- CUST_ID is the primary key, so concurrent duplicate first-registration inserts
--- are rejected by Oracle. Java should treat ORA-00001 as a concurrency conflict,
--- re-read current state, and re-evaluate the request instead of overwriting data.
+-- SCENARIOS 2 AND 3 -----------------------------------------------------------
+-- First successful registration has never passed through cooling, therefore
+-- ACTIVE.COOLING_START_TIME and ACTIVE.COOLING_END_TIME are stored as NULL.
 INSERT INTO ACTIVE_PASSKEY
 (
     CUST_ID,
     MOBILE_NUMBER,
     PASSKEY_HASH,
+    COOLING_START_TIME,
+    COOLING_END_TIME,
     UPDATED_TIME
 )
 VALUES
@@ -85,22 +70,16 @@ VALUES
     :custId,
     :mobileNumber,
     :incomingHash,
+    NULL,
+    NULL,
     SYSTIMESTAMP AT TIME ZONE 'UTC'
 );
 
--- ----------------------------------------------------------------------------
--- SCENARIO 4: incoming hash matches ACTIVE
--- ----------------------------------------------------------------------------
--- If no PENDING row exists: no DML is required; return success.
--- If a PENDING row exists: execute Scenario 6 because the original trusted
--- ACTIVE hash has been reconfirmed and the pending change is no longer relevant.
+-- SCENARIO 4 -----------------------------------------------------------------
+-- If incoming hash matches ACTIVE and no PENDING exists, no DML is required.
+-- If PENDING exists, execute Scenario 6.
 
--- ----------------------------------------------------------------------------
--- COMMON: create a new pending verification cycle
--- Used by Scenarios 5, 8 and 10.
--- ----------------------------------------------------------------------------
--- Generate the current UTC timestamp once inside this SQL statement so the
--- cooling start and end are based on exactly the same instant.
+-- COMMON: CREATE NEW PENDING --------------------------------------------------
 INSERT INTO PASSKEY_PENDING_VERIFICATION
 (
     CUST_ID,
@@ -120,13 +99,7 @@ FROM
     FROM DUAL
 ) T;
 
--- Create all four SMS records from the exact COOLING_START_TIME persisted above.
--- Identity column SMS_SCHEDULE_ID is intentionally omitted from INSERT.
--- Sequence mapping:
---   1 = immediate
---   2 = +15 hours
---   3 = +30 hours
---   4 = +46 hours
+-- Create SMS at 0h, 15h, 30h and 46h from exact stored cooling start.
 INSERT INTO PASSKEY_SMS_SCHEDULE
 (
     CUST_ID,
@@ -148,13 +121,13 @@ SELECT P.CUST_ID,
            WHEN 2 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(15, 'HOUR')
            WHEN 3 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(30, 'HOUR')
            WHEN 4 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(46, 'HOUR')
-       END AS SCHEDULED_TIME,
+       END,
        CASE S.SMS_SEQUENCE
            WHEN 1 THEN P.COOLING_START_TIME
            WHEN 2 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(15, 'HOUR')
            WHEN 3 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(30, 'HOUR')
            WHEN 4 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(46, 'HOUR')
-       END AS NEXT_ATTEMPT_TIME,
+       END,
        'PENDING',
        SYSTIMESTAMP AT TIME ZONE 'UTC',
        SYSTIMESTAMP AT TIME ZONE 'UTC'
@@ -168,29 +141,12 @@ CROSS JOIN
 ) S
 WHERE P.CUST_ID = :custId;
 
--- Java should verify that exactly four rows were inserted.
+-- SCENARIO 5 -----------------------------------------------------------------
+-- Lock ACTIVE, confirm no PENDING, insert PENDING, insert exactly 4 SMS, commit.
 
--- ----------------------------------------------------------------------------
--- SCENARIO 5: first mismatch
--- ----------------------------------------------------------------------------
--- Preconditions while ACTIVE is locked:
---   * ACTIVE exists.
---   * Incoming hash does not match ACTIVE hash.
---   * No PENDING row exists.
--- Transaction:
---   1. Insert PENDING row.
---   2. Insert exactly four SMS rows.
---   3. Commit.
--- ACTIVE remains unchanged.
-
--- ----------------------------------------------------------------------------
--- COMMON: archive current PENDING row
--- ----------------------------------------------------------------------------
--- ARCHIVAL_ID is generated by Oracle identity and is intentionally omitted.
--- :archiveReason must be:
---   AR102 = original ACTIVE hash reconfirmed (Scenario 6)
---   AR103 = pending hash replaced during cooling (Scenario 8)
---   AR104 = pending hash replaced after cooling (Scenario 10)
+-- COMMON: ARCHIVE CURRENT PENDING --------------------------------------------
+-- AR102 = ACTIVE reconfirmed, AR103 = replaced during cooling,
+-- AR104 = replaced after cooling.
 INSERT INTO PASSKEY_ARCHIVAL
 (
     CUST_ID,
@@ -211,15 +167,7 @@ SELECT CUST_ID,
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = :custId;
 
--- Java must verify exactly one row was archived before deleting PENDING.
-
--- ----------------------------------------------------------------------------
--- COMMON: cancel unsent SMS rows for one exact cooling cycle
--- ----------------------------------------------------------------------------
--- :coolingStartTime must be the value read from the locked PENDING row.
--- SENT rows remain for audit. PROCESSING rows are intentionally not cancelled
--- because a provider call may already be in progress; worker/provider idempotency
--- must resolve that race safely.
+-- COMMON: CANCEL UNSENT SMS ---------------------------------------------------
 UPDATE PASSKEY_SMS_SCHEDULE
 SET SMS_STATUS = 'CANCELLED',
     CANCELLED_TIME = SYSTIMESTAMP AT TIME ZONE 'UTC',
@@ -231,29 +179,16 @@ WHERE CUST_ID = :custId
   AND COOLING_START_TIME = :coolingStartTime
   AND SMS_STATUS IN ('PENDING', 'QUEUED');
 
--- Delete current PENDING only after archival/cancellation steps have succeeded.
+-- Delete only the exact PENDING cycle read/locked by Java.
 DELETE FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = :custId
   AND COOLING_START_TIME = :coolingStartTime;
 
--- Java should verify exactly one row was deleted.
+-- SCENARIO 6 -----------------------------------------------------------------
+-- ACTIVE hash reconfirmed while PENDING exists:
+-- archive PENDING as AR102, cancel remaining SMS, delete PENDING, commit.
 
--- ----------------------------------------------------------------------------
--- SCENARIO 6: original ACTIVE hash used during cooling
--- ----------------------------------------------------------------------------
--- Preconditions:
---   * Incoming hash matches locked ACTIVE hash.
---   * PENDING exists.
--- Transaction:
---   1. Archive PENDING with ARCHIVE_REASON='AR102'.
---   2. Cancel PENDING/QUEUED SMS for the exact cooling cycle.
---   3. Delete PENDING row.
--- ACTIVE remains unchanged; authentication succeeds.
-
--- ----------------------------------------------------------------------------
--- SCENARIO 7: same PENDING hash during cooling
--- ----------------------------------------------------------------------------
--- Determine whether the cooling period is still active.
+-- SCENARIO 7 -----------------------------------------------------------------
 SELECT CUST_ID,
        PASSKEY_HASH,
        COOLING_START_TIME,
@@ -264,45 +199,25 @@ SELECT CUST_ID,
        END AS COOLING_ACTIVE
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = :custId;
+-- Matching PENDING during active cooling => no DML and no cooling reset.
 
--- When incoming hash matches PENDING and COOLING_ACTIVE='Y':
---   * No DML is performed.
---   * Cooling is not reset.
---   * No additional immediate SMS is created.
---   * Existing 15h/30h/46h schedule continues.
---   * Return authentication failure and report the attempt to PRM.
+-- SCENARIO 8 -----------------------------------------------------------------
+-- Different hash during cooling:
+-- archive old PENDING AR103, cancel SMS, delete PENDING, create new PENDING,
+-- create 4 fresh SMS rows, commit. ACTIVE is unchanged.
 
--- ----------------------------------------------------------------------------
--- SCENARIO 8: a different hash is received during cooling
--- ----------------------------------------------------------------------------
--- Preconditions while rows are locked:
---   * Incoming hash does not match ACTIVE.
---   * Incoming hash does not match PENDING.
---   * Current UTC time < PENDING.COOLING_END_TIME.
--- Transaction:
---   1. Archive old PENDING with AR103.
---   2. Cancel unsent SMS for old COOLING_START_TIME.
---   3. Delete old PENDING.
---   4. Insert new PENDING with a fresh 48-hour cooling period.
---   5. Insert exactly four new SMS rows.
--- ACTIVE remains unchanged.
-
--- ----------------------------------------------------------------------------
--- SCENARIO 9: matching PENDING hash after cooling
--- ----------------------------------------------------------------------------
--- Preconditions while ACTIVE and PENDING are locked:
---   * Incoming hash does not match ACTIVE.
---   * Incoming hash matches PENDING.
---   * Current UTC time >= PENDING.COOLING_END_TIME.
-
--- Step 1: archive ACTIVE defensively only when the matching pending hash exists
--- and its cooling period has completed. ARCHIVAL_ID is generated automatically.
+-- SCENARIO 9 -----------------------------------------------------------------
+-- Matching PENDING hash after cooling.
+-- Step 1: archive existing ACTIVE. The ACTIVE row now retains its own activation
+-- cooling window, so copy those values into archival before replacement.
 INSERT INTO PASSKEY_ARCHIVAL
 (
     CUST_ID,
     PASSKEY_HASH,
     SOURCE_TYPE,
     ORIGINAL_UPDATED_TIME,
+    ORIGINAL_COOLING_START_TIME,
+    ORIGINAL_COOLING_END_TIME,
     ARCHIVE_REASON,
     ARCHIVED_TIME
 )
@@ -310,6 +225,8 @@ SELECT A.CUST_ID,
        A.PASSKEY_HASH,
        'ACTIVE',
        A.UPDATED_TIME,
+       A.COOLING_START_TIME,
+       A.COOLING_END_TIME,
        'AR101',
        SYSTIMESTAMP AT TIME ZONE 'UTC'
 FROM ACTIVE_PASSKEY A
@@ -323,20 +240,27 @@ WHERE A.CUST_ID = :custId
             AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
       );
 
--- Java must verify exactly one ACTIVE record was archived.
-
--- Step 2: promote the matching PENDING hash into the stable ACTIVE row.
+-- Step 2: promote PENDING into ACTIVE and preserve the completed cooling window.
 UPDATE ACTIVE_PASSKEY A
-SET (A.PASSKEY_HASH, A.MOBILE_NUMBER, A.UPDATED_TIME) =
-    (
-        SELECT P.PASSKEY_HASH,
-               P.MOBILE_NUMBER,
-               SYSTIMESTAMP AT TIME ZONE 'UTC'
-        FROM PASSKEY_PENDING_VERIFICATION P
-        WHERE P.CUST_ID = A.CUST_ID
-          AND P.PASSKEY_HASH = :incomingHash
-          AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
-    )
+SET
+(
+    A.PASSKEY_HASH,
+    A.MOBILE_NUMBER,
+    A.COOLING_START_TIME,
+    A.COOLING_END_TIME,
+    A.UPDATED_TIME
+) =
+(
+    SELECT P.PASSKEY_HASH,
+           P.MOBILE_NUMBER,
+           P.COOLING_START_TIME,
+           P.COOLING_END_TIME,
+           SYSTIMESTAMP AT TIME ZONE 'UTC'
+    FROM PASSKEY_PENDING_VERIFICATION P
+    WHERE P.CUST_ID = A.CUST_ID
+      AND P.PASSKEY_HASH = :incomingHash
+      AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
+)
 WHERE A.CUST_ID = :custId
   AND EXISTS
       (
@@ -347,37 +271,21 @@ WHERE A.CUST_ID = :custId
             AND (SYSTIMESTAMP AT TIME ZONE 'UTC') >= P.COOLING_END_TIME
       );
 
--- Java must verify exactly one ACTIVE row was updated.
--- Step 3: cancel any remaining PENDING/QUEUED SMS for the old cooling cycle.
--- Step 4: delete the PENDING row using CUST_ID + original COOLING_START_TIME.
--- Do NOT archive the pending hash: it is now the current ACTIVE hash.
--- Commit only after all four steps succeed.
+-- Java must verify exactly one row archived and exactly one ACTIVE row updated.
+-- Then cancel remaining SMS for the old PENDING cycle and delete PENDING.
 
--- ----------------------------------------------------------------------------
--- SCENARIO 10: different hash received after cooling completed
--- ----------------------------------------------------------------------------
--- Preconditions while rows are locked:
---   * Incoming hash does not match ACTIVE.
---   * Incoming hash does not match PENDING.
---   * Current UTC time >= PENDING.COOLING_END_TIME.
--- Transaction:
---   1. Archive old PENDING with AR104.
---   2. Cancel unsent SMS for old COOLING_START_TIME.
---   3. Delete old PENDING.
---   4. Insert new PENDING with a fresh 48-hour cooling period.
---   5. Insert exactly four fresh SMS rows.
--- Existing ACTIVE remains unchanged.
+-- SCENARIO 10 ----------------------------------------------------------------
+-- Different hash after cooling:
+-- archive old PENDING AR104, cancel SMS, delete PENDING, create new PENDING,
+-- create 4 new SMS rows. Existing ACTIVE including its historical cooling window
+-- remains unchanged.
 
--- ----------------------------------------------------------------------------
--- TRANSACTION SAFETY SUMMARY
--- ----------------------------------------------------------------------------
+-- TRANSACTION SUMMARY ---------------------------------------------------------
 -- Scenario 5  : lock ACTIVE -> confirm no PENDING -> insert PENDING + 4 SMS.
 -- Scenario 6  : lock ACTIVE -> lock PENDING -> archive/cancel/delete PENDING.
 -- Scenario 7  : read-only.
--- Scenario 8  : lock ACTIVE -> lock PENDING -> archive/cancel/delete old PENDING
---               -> insert new PENDING + 4 SMS.
--- Scenario 9  : lock ACTIVE -> lock PENDING -> archive ACTIVE -> promote PENDING
---               -> cancel remaining SMS -> delete PENDING.
--- Scenario 10 : lock ACTIVE -> lock PENDING -> archive/cancel/delete old PENDING
---               -> insert new PENDING + 4 SMS.
--- Any failure in a state-changing flow must cause JDBC rollback.
+-- Scenario 8  : archive/cancel/delete old PENDING -> new PENDING + 4 SMS.
+-- Scenario 9  : archive ACTIVE (with its cooling window) -> promote PENDING
+--               (including its cooling window) -> cancel SMS -> delete PENDING.
+-- Scenario 10 : archive/cancel/delete old PENDING -> new PENDING + 4 SMS.
+-- Any state-changing failure must cause JDBC rollback.

@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Support and audit queries for the passkey schema.
 -- Avoid exposing full passkey hashes in operational UIs or application logs.
--- All stored timestamps are plain TIMESTAMP(6) values representing UTC.
+-- All stored timestamps are plain TIMESTAMP(6); no timezone conversion is used.
 -- ============================================================================
 
 -- Current ACTIVE and PENDING state for one customer.
@@ -16,7 +16,7 @@ SELECT A.CUST_ID,
        P.COOLING_END_TIME AS PENDING_COOLING_END_TIME,
        CASE
            WHEN P.COOLING_END_TIME IS NULL THEN 'NOT_APPLICABLE'
-           WHEN SYS_EXTRACT_UTC(SYSTIMESTAMP) < P.COOLING_END_TIME
+           WHEN LOCALTIMESTAMP < P.COOLING_END_TIME
                THEN 'ACTIVE'
            ELSE 'COMPLETED'
        END AS PENDING_COOLING_STATUS
@@ -62,7 +62,7 @@ SELECT CUST_ID,
        COOLING_START_TIME,
        COOLING_END_TIME
 FROM PASSKEY_PENDING_VERIFICATION
-WHERE SYS_EXTRACT_UTC(SYSTIMESTAMP) >= COOLING_END_TIME
+WHERE LOCALTIMESTAMP >= COOLING_END_TIME
 ORDER BY COOLING_END_TIME;
 
 -- Scheduler backlog summary.
@@ -85,5 +85,5 @@ SELECT SMS_SCHEDULE_ID,
 FROM PASSKEY_SMS_SCHEDULE
 WHERE SMS_STATUS = 'PENDING'
   AND NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME)
-      < SYS_EXTRACT_UTC(SYSTIMESTAMP)
+      < LOCALTIMESTAMP
 ORDER BY NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME);

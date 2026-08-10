@@ -19,23 +19,44 @@ passkey/
 
 ## Business model
 
-- `ACTIVE_PASSKEY`: one currently trusted passkey per customer.
+- `ACTIVE_PASSKEY`: one currently trusted passkey per customer. It also stores the cooling window through which the current hash became active. Those two fields are `NULL` for a passkey that became active on first registration.
 - `PASSKEY_PENDING_VERIFICATION`: at most one changed hash per customer during/after the current 48-hour cooling period.
-- `PASSKEY_ARCHIVAL`: immutable history of active or pending hashes that are no longer current.
+- `PASSKEY_ARCHIVAL`: immutable history of active or pending hashes that are no longer current. When an ACTIVE hash is archived, its historical activation cooling window is copied too.
 - `PASSKEY_SMS_SCHEDULE`: independent SMS schedule and delivery history. Four rows are created per cooling cycle: immediately, +15 hours, +30 hours and +46 hours.
 
-The simplified passkey tables intentionally do not store request IDs, version numbers, activation timestamps or a synthetic verification-cycle ID. SMS cycles are identified by `CUST_ID + COOLING_START_TIME`.
+SMS cycles are identified by `CUST_ID + COOLING_START_TIME`.
+
+## Why ACTIVE stores cooling timestamps
+
+When a PENDING hash successfully completes 48 hours and is promoted in Scenario 9, the PENDING row is deleted. Without copying `COOLING_START_TIME` and `COOLING_END_TIME` into `ACTIVE_PASSKEY`, the system would lose the cooling window through which that hash became trusted.
+
+Therefore Scenario 9 performs this transition:
+
+```text
+PENDING
+  hash B
+  cooling start T1
+  cooling end   T2
+       |
+       v
+ACTIVE
+  hash B
+  cooling start T1
+  cooling end   T2
+```
+
+Later, if hash B is replaced, those values are copied from ACTIVE into `PASSKEY_ARCHIVAL`.
 
 ## Identity columns
 
-`PASSKEY_ARCHIVAL.ARCHIVAL_ID` and `PASSKEY_SMS_SCHEDULE.SMS_SCHEDULE_ID` are Oracle 19c identity columns:
+`PASSKEY_ARCHIVAL.ARCHIVAL_ID` and `PASSKEY_SMS_SCHEDULE.SMS_SCHEDULE_ID` use Oracle identity columns:
 
 ```sql
 GENERATED ALWAYS AS IDENTITY
 (START WITH 1 INCREMENT BY 1 CACHE 100 NOCYCLE)
 ```
 
-They are technical surrogate keys with no business meaning. Java must not generate or provide these values.
+Java must not generate or provide these values.
 
 ## Archive reason codes
 
@@ -46,71 +67,49 @@ They are technical surrogate keys with no business meaning. Java must not genera
 | `AR103` | PENDING_VERIFICATION | PENDING hash replaced by another different hash while cooling was still active. |
 | `AR104` | PENDING_VERIFICATION | PENDING hash replaced by another different hash after the previous cooling period completed. |
 
-The DDL enforces the valid `SOURCE_TYPE + ARCHIVE_REASON` combinations.
-
 ## Time handling
 
-All schema timestamps use `TIMESTAMP(6) WITH TIME ZONE`. DML, JDBC and scheduler queries explicitly use UTC with `SYSTIMESTAMP AT TIME ZONE 'UTC'`.
+All schema timestamps use `TIMESTAMP(6) WITH TIME ZONE`. DML, JDBC and scheduler queries use UTC with `SYSTIMESTAMP AT TIME ZONE 'UTC'`.
 
-When a new PENDING record is created, one UTC timestamp is selected and reused for both `COOLING_START_TIME` and `COOLING_END_TIME = start + 48 hours`. SMS due times are derived from the stored cooling start.
+When a PENDING row is created, one UTC timestamp is reused for both cooling start and `start + 48 hours`. SMS due times are derived from the stored cooling start.
 
-## JDBC query file
+## JDBC guidance
 
-`passkey/jdbc/05_jdbc_queries.sql` contains the SQL intended to be copied into Java/JDBC repository/DAO classes.
+`passkey/jdbc/05_jdbc_queries.sql` contains positional `?` SQL ready for `PreparedStatement` usage. It documents parameter order and expected row counts.
 
-The JDBC file uses positional `?` placeholders rather than named bind variables and documents, for every statement:
-
-- exact PreparedStatement parameter order;
-- expected query/update row count;
-- whether the query is read-only or part of a transaction;
-- which business scenario uses it;
-- lock ordering requirements.
-
-For state-changing scenarios Java should use:
+For state-changing scenarios:
 
 ```java
 connection.setAutoCommit(false);
 ```
 
-and call `commit()` only after every mandatory statement returns the expected result. Any SQL error or unexpected mandatory row count should result in `rollback()`.
+Commit only after all mandatory statements succeed; otherwise roll back.
 
-### JDBC transaction summary
+Important Scenario 9 behavior:
 
-- Scenarios 2/3: read ACTIVE, then insert first ACTIVE if absent.
-- Scenario 5: lock ACTIVE, confirm no PENDING, insert PENDING, insert four SMS rows.
-- Scenario 6: lock ACTIVE/PENDING, archive PENDING as `AR102`, cancel unsent SMS, delete PENDING.
-- Scenario 7: read-only; no DML while same pending hash is retried within cooling.
-- Scenario 8: archive old PENDING as `AR103`, cancel/delete old cycle, create new PENDING and four SMS rows.
-- Scenario 9: archive ACTIVE as `AR101`, promote matching PENDING only after cooling, cancel remaining SMS, delete PENDING.
-- Scenario 10: archive old PENDING as `AR104`, cancel/delete old cycle, create a fresh 48-hour cycle.
+- archive the old ACTIVE record including its existing cooling timestamps;
+- promote PENDING to ACTIVE including `PASSKEY_HASH`, `MOBILE_NUMBER`, `COOLING_START_TIME`, and `COOLING_END_TIME`;
+- cancel remaining SMS for the old pending cycle;
+- delete the PENDING row.
 
 ## Transaction and concurrency rules
 
-- Lock `ACTIVE_PASSKEY` before `PASSKEY_PENDING_VERIFICATION` whenever both records are involved in a state change.
+- Lock `ACTIVE_PASSKEY` before `PASSKEY_PENDING_VERIFICATION` whenever both records are involved.
 - Scenario 5 inserts PENDING plus four SMS rows atomically.
 - Scenario 6 archives/cancels/deletes PENDING atomically.
-- Scenario 8 archives the old pending state, cancels its unsent SMS, creates a new pending state, and creates four new SMS rows atomically.
-- Scenario 9 archives ACTIVE and promotes PENDING only when SQL also confirms the incoming hash matches PENDING and cooling has completed.
-- Scenario 10 archives the old pending state and starts a fresh cooling/SMS cycle atomically.
-- Any failed state transition must be rolled back by JDBC.
-- First-time concurrent inserts are protected by `ACTIVE_PASSKEY(CUST_ID)` primary-key uniqueness; Java should re-read state if an insert loses that race.
+- Scenario 8 archives the old pending state, cancels its SMS, and creates a fresh cycle atomically.
+- Scenario 9 archives ACTIVE and promotes PENDING only after hash match and cooling completion are confirmed.
+- Scenario 10 archives the old pending state and starts a fresh cycle atomically.
+- Any failed transition must be rolled back.
 
 ## Scheduler design
 
-The database remains the durable source of truth. Java `DelayQueue` is only an in-memory timing mechanism.
-
-The scheduler scan uses:
-
-```sql
-NVL(NEXT_ATTEMPT_TIME, SCHEDULED_TIME)
-```
-
-The schema includes a matching function-based index. `FOR UPDATE SKIP LOCKED` allows multiple scheduler instances to scan without claiming the same row.
+The database remains the durable source of truth. Java `DelayQueue` is only an in-memory timing mechanism. Scheduler scans use `FOR UPDATE SKIP LOCKED` and the function-based due-time index.
 
 ## Execution order
 
 1. Run `passkey/ddl/01_passkey_schema.sql`.
 2. Use `passkey/jdbc/05_jdbc_queries.sql` for Java/JDBC implementation.
-3. Use `passkey/dml/02_passkey_scenario_queries.sql` as the named-bind/reference version of the business SQL.
-4. Use `passkey/scheduler/03_sms_scheduler_queries.sql` for the database scanner and Java `DelayQueue` worker.
+3. Use `passkey/dml/02_passkey_scenario_queries.sql` as the named-bind/reference version.
+4. Use `passkey/scheduler/03_sms_scheduler_queries.sql` for SMS scanning and DelayQueue workers.
 5. Use `passkey/dml/04_audit_queries.sql` for support and operational monitoring.

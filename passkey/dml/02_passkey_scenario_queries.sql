@@ -4,8 +4,9 @@
 -- ACTIVE is locked before PENDING for state-changing scenarios.
 --
 -- Time rule:
---   Database columns are plain TIMESTAMP(6). All stored values represent UTC.
---   SYS_EXTRACT_UTC(SYSTIMESTAMP) is used whenever Oracle generates "now".
+--   Database columns are plain TIMESTAMP(6).
+--   No UTC conversion or time-zone conversion is performed.
+--   LOCALTIMESTAMP is used whenever Oracle generates the current timestamp.
 -- ============================================================================
 
 -- COMMON LOOKUPS -------------------------------------------------------------
@@ -71,7 +72,7 @@ VALUES
     :incomingHash,
     NULL,
     NULL,
-    SYS_EXTRACT_UTC(SYSTIMESTAMP)
+    LOCALTIMESTAMP
 );
 
 -- SCENARIO 4 -----------------------------------------------------------------
@@ -79,7 +80,7 @@ VALUES
 -- If PENDING exists, execute Scenario 6.
 
 -- COMMON: CREATE NEW PENDING --------------------------------------------------
--- Generate UTC "now" once so start and end use the exact same reference instant.
+-- Generate current timestamp once so start/end use the exact same value.
 INSERT INTO PASSKEY_PENDING_VERIFICATION
 (
     CUST_ID,
@@ -91,11 +92,11 @@ INSERT INTO PASSKEY_PENDING_VERIFICATION
 SELECT :custId,
        :incomingHash,
        :mobileNumber,
-       T.UTC_NOW,
-       T.UTC_NOW + NUMTODSINTERVAL(48, 'HOUR')
+       T.CURRENT_TS,
+       T.CURRENT_TS + NUMTODSINTERVAL(48, 'HOUR')
 FROM
 (
-    SELECT SYS_EXTRACT_UTC(SYSTIMESTAMP) AS UTC_NOW
+    SELECT LOCALTIMESTAMP AS CURRENT_TS
     FROM DUAL
 ) T;
 
@@ -129,8 +130,8 @@ SELECT P.CUST_ID,
            WHEN 4 THEN P.COOLING_START_TIME + NUMTODSINTERVAL(46, 'HOUR')
        END,
        'PENDING',
-       SYS_EXTRACT_UTC(SYSTIMESTAMP),
-       SYS_EXTRACT_UTC(SYSTIMESTAMP)
+       LOCALTIMESTAMP,
+       LOCALTIMESTAMP
 FROM PASSKEY_PENDING_VERIFICATION P
 CROSS JOIN
 (
@@ -163,18 +164,18 @@ SELECT CUST_ID,
        COOLING_START_TIME,
        COOLING_END_TIME,
        :archiveReason,
-       SYS_EXTRACT_UTC(SYSTIMESTAMP)
+       LOCALTIMESTAMP
 FROM PASSKEY_PENDING_VERIFICATION
 WHERE CUST_ID = :custId;
 
 -- COMMON: CANCEL UNSENT SMS ---------------------------------------------------
 UPDATE PASSKEY_SMS_SCHEDULE
 SET SMS_STATUS = 'CANCELLED',
-    CANCELLED_TIME = SYS_EXTRACT_UTC(SYSTIMESTAMP),
+    CANCELLED_TIME = LOCALTIMESTAMP,
     CANCEL_REASON = :cancelReason,
     LOCKED_BY = NULL,
     LOCKED_TIME = NULL,
-    UPDATED_TIME = SYS_EXTRACT_UTC(SYSTIMESTAMP)
+    UPDATED_TIME = LOCALTIMESTAMP
 WHERE CUST_ID = :custId
   AND COOLING_START_TIME = :coolingStartTime
   AND SMS_STATUS IN ('PENDING', 'QUEUED');
@@ -194,7 +195,7 @@ SELECT CUST_ID,
        COOLING_START_TIME,
        COOLING_END_TIME,
        CASE
-           WHEN SYS_EXTRACT_UTC(SYSTIMESTAMP) < COOLING_END_TIME THEN 'Y'
+           WHEN LOCALTIMESTAMP < COOLING_END_TIME THEN 'Y'
            ELSE 'N'
        END AS COOLING_ACTIVE
 FROM PASSKEY_PENDING_VERIFICATION
@@ -227,7 +228,7 @@ SELECT A.CUST_ID,
        A.COOLING_START_TIME,
        A.COOLING_END_TIME,
        'AR101',
-       SYS_EXTRACT_UTC(SYSTIMESTAMP)
+       LOCALTIMESTAMP
 FROM ACTIVE_PASSKEY A
 WHERE A.CUST_ID = :custId
   AND EXISTS
@@ -236,7 +237,7 @@ WHERE A.CUST_ID = :custId
           FROM PASSKEY_PENDING_VERIFICATION P
           WHERE P.CUST_ID = A.CUST_ID
             AND P.PASSKEY_HASH = :incomingHash
-            AND SYS_EXTRACT_UTC(SYSTIMESTAMP) >= P.COOLING_END_TIME
+            AND LOCALTIMESTAMP >= P.COOLING_END_TIME
       );
 
 -- Step 2: promote PENDING into ACTIVE and preserve the completed cooling window.
@@ -254,11 +255,11 @@ SET
            P.MOBILE_NUMBER,
            P.COOLING_START_TIME,
            P.COOLING_END_TIME,
-           SYS_EXTRACT_UTC(SYSTIMESTAMP)
+           LOCALTIMESTAMP
     FROM PASSKEY_PENDING_VERIFICATION P
     WHERE P.CUST_ID = A.CUST_ID
       AND P.PASSKEY_HASH = :incomingHash
-      AND SYS_EXTRACT_UTC(SYSTIMESTAMP) >= P.COOLING_END_TIME
+      AND LOCALTIMESTAMP >= P.COOLING_END_TIME
 )
 WHERE A.CUST_ID = :custId
   AND EXISTS
@@ -267,7 +268,7 @@ WHERE A.CUST_ID = :custId
           FROM PASSKEY_PENDING_VERIFICATION P
           WHERE P.CUST_ID = A.CUST_ID
             AND P.PASSKEY_HASH = :incomingHash
-            AND SYS_EXTRACT_UTC(SYSTIMESTAMP) >= P.COOLING_END_TIME
+            AND LOCALTIMESTAMP >= P.COOLING_END_TIME
       );
 
 -- Java must verify exactly one row archived and exactly one ACTIVE row updated.

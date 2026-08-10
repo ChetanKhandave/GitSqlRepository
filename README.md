@@ -52,21 +52,19 @@ Java must not generate or provide these values.
 
 ## Time handling
 
-All database date/time columns use plain Oracle `TIMESTAMP(6)` — not `TIMESTAMP WITH TIME ZONE`.
+All database date/time columns use plain Oracle `TIMESTAMP(6)`.
 
-The application/database convention is that every stored timestamp represents **UTC**. Because plain `TIMESTAMP` carries no offset or zone metadata, code must not interpret these values as database-session local time.
-
-Whenever Oracle generates the current time, the SQL uses:
+No UTC conversion, fixed time-zone conversion, or offset handling is performed in the SQL. Whenever Oracle needs the current timestamp, the queries use:
 
 ```sql
-SYS_EXTRACT_UTC(SYSTIMESTAMP)
+LOCALTIMESTAMP
 ```
 
-`SYS_EXTRACT_UTC` converts Oracle's `SYSTIMESTAMP` to UTC and returns a plain `TIMESTAMP`, matching the table column type.
+`LOCALTIMESTAMP` returns Oracle `TIMESTAMP`, which directly matches the table column type.
 
-When a PENDING row is created, one UTC timestamp is reused for both cooling start and `start + 48 hours`. SMS due times are derived from the stored cooling start.
+When a PENDING row is created, one `LOCALTIMESTAMP` value is reused for both cooling start and `start + 48 hours`. SMS due times are derived from the stored cooling start.
 
-For JDBC, bind/read these columns as `java.sql.Timestamp` (or convert to/from `Instant` in the Java layer while preserving the UTC convention).
+For JDBC, bind/read these columns using `java.sql.Timestamp` or an equivalent Java type suitable for a timezone-less timestamp.
 
 ## JDBC guidance
 
